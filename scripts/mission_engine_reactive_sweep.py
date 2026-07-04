@@ -640,9 +640,15 @@ def plan_approve_propagations(conn) -> list[ApprovePropagation]:
         if not _is_approve_verdict(conn, gate):
             continue
         metadata = _block_metadata(conn, gate["id"])
-        target_id = _target_task_for_gate(conn, gate["id"], metadata)
-        if not target_id:
+        immediate_target = _target_task_for_gate(conn, gate["id"], metadata)
+        if not immediate_target:
             continue
+        # Resolve through the cure/re-gate lineage to the ORIGINAL blocked build,
+        # mirroring plan_actions. A re-gate's metadata target_task is the cure card
+        # (which completes and goes `done`), so without this the APPROVE never lands
+        # on the real build and it is stranded blocked forever (audit finding #4:
+        # t_1d942c15 approved-but-blocked behind done cure t_2f219b8f).
+        target_id = _lineage_root(conn, immediate_target)
         target = _task(conn, target_id)
         if not target or not _is_review_required_blocked(conn, target):
             continue
@@ -720,6 +726,42 @@ def apply_actions(conn, actions: list[Action]) -> list[dict[str, Any]]:
     return results
 
 
+def _open_gate_exists(conn, root_id: str) -> bool:
+    """True if a non-terminal gatewarden gate references this lineage root by id."""
+    rows = _rows(
+        conn,
+        "SELECT id, title, body FROM tasks WHERE assignee = ? AND status IN ('todo', 'ready', 'running')",
+        (GATEWARDEN,),
+    )
+    return any(root_id in f"{row['title'] or ''} {row['body'] or ''}" for row in rows)
+
+
+def detect_stalls(conn) -> list[dict[str, Any]]:
+    """Blocked cards the sweep cannot advance and that await a human.
+
+    Only meaningful when the sweep plans zero actions: it distinguishes a
+    genuinely converged board from a frozen one. A card is stalled when it is
+    review-required-blocked and no open (todo/ready/running) gatewarden gate
+    exists for its lineage to unblock it. Detection/reporting only — no card is
+    minted here; the escalation-delivery half is the observability cluster's job
+    (audit #5/#17: a 0-action sweep must not be indistinguishable from converged).
+    """
+    stalls: list[dict[str, Any]] = []
+    for row in _rows(conn, "SELECT * FROM tasks WHERE status = 'blocked' ORDER BY created_at"):
+        if not _is_review_required_blocked(conn, row):
+            continue
+        root = _lineage_root(conn, row["id"])
+        if _open_gate_exists(conn, root) or _open_gate_exists(conn, row["id"]):
+            continue
+        stalls.append({
+            "task_id": row["id"],
+            "lineage_root": root,
+            "title": str(row["title"] or "")[:80],
+            "reason": "review-required-blocked; no open gate and no sweep action — awaiting human",
+        })
+    return stalls
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Reactive Mission Commander sweep for Spec 002 Kanban board")
     parser.add_argument("--board", default=BOARD, help=f"Board slug (default: {BOARD})")
@@ -733,12 +775,17 @@ def main(argv: list[str] | None = None) -> int:
     conn = kb.connect(board=BOARD)
     actions = plan_actions(conn)
     approve_propagations = plan_approve_propagations(conn)
+    total_planned = len(actions) + len(approve_propagations)
+    # Only compute stalls when the sweep plans nothing — that is precisely when a
+    # bare "0 actions" would otherwise be indistinguishable from a converged board.
+    stalls = [] if total_planned else detect_stalls(conn)
+    health = "active" if total_planned else ("stalled" if stalls else "converged")
     if args.apply:
         applied_actions = apply_actions(conn, actions) + apply_approve_propagations(conn, approve_propagations)
-        result = {"mode": "apply", "board": BOARD, "actions_planned": len(actions) + len(approve_propagations), "actions": applied_actions}
+        result = {"mode": "apply", "board": BOARD, "actions_planned": total_planned, "actions": applied_actions, "health": health, "stalls": stalls}
     else:
         dry_run_actions = [a.__dict__ for a in actions] + [p.__dict__ | {"kind": "approve_propagation"} for p in approve_propagations]
-        result = {"mode": "dry-run", "board": BOARD, "actions_planned": len(dry_run_actions), "actions": dry_run_actions}
+        result = {"mode": "dry-run", "board": BOARD, "actions_planned": len(dry_run_actions), "actions": dry_run_actions, "health": health, "stalls": stalls}
     if args.json:
         if args.quiet_if_empty and not actions and not approve_propagations:
             return 0

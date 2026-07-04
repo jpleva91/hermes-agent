@@ -828,3 +828,102 @@ def test_archived_blocked_card_is_not_scanned(kanban_home):
         assert kb.archive_task(conn, blocked_id)
 
         assert sweep.plan_actions(conn) == []
+
+
+# ---------------------------------------------------------------------------
+# FIX [audit #4]: APPROVE propagation resolves a re-gate through the cure/re-gate
+# lineage to the ORIGINAL blocked build, not the (done) cure card, so the build
+# is not stranded blocked-with-its-approval-on-the-wrong-card forever.
+# ---------------------------------------------------------------------------
+
+
+def test_approve_propagation_resolves_regate_target_to_lineage_root(kanban_home):
+    with _conn() as conn:
+        build_id = _mk_target(conn, title="Implement mission architecture", body="the real build work")
+        assert kb.block_task(conn, build_id, reason="review-required: build changed runtime", kind="needs_input")
+
+        # Cure card whose body points at the original build (matches the lineage
+        # regex), then completes and goes done -- the shape that stranded t_1d942c15.
+        cure_id = kb.create_task(
+            conn,
+            title="Cure: Implement mission architecture",
+            body=f"Mission Commander reactive cure card for Gate Warden BLOCK `t_00000000` against `{build_id}`.",
+            assignee="runtimesteward",
+            created_by="missioncommander",
+            board=sweep.BOARD,
+        )
+        assert kb.complete_task(conn, cure_id, summary="cure applied", metadata={"verdict": "APPROVE"})
+
+        # Re-gate whose immediate target (metadata target_task) is the DONE cure card.
+        regate_id = kb.create_task(
+            conn,
+            title="Re-gate: Implement mission architecture",
+            body=f"reactive re-gate for cure card `{cure_id}` after Gate Warden BLOCK `t_00000000` on target `{build_id}`.",
+            assignee="gatewarden",
+            created_by="missioncommander",
+            board=sweep.BOARD,
+        )
+        assert kb.complete_task(
+            conn,
+            regate_id,
+            summary="APPROVE: raw evidence checked",
+            metadata={"verdict": "APPROVE", "target_task": cure_id},
+        )
+
+        propagations = sweep.plan_approve_propagations(conn)
+        assert len(propagations) == 1
+        assert propagations[0].gate_id == regate_id
+        # The fix: resolves to the original build, NOT the done cure card.
+        assert propagations[0].target_id == build_id
+        assert propagations[0].target_id != cure_id
+
+        sweep.apply_approve_propagations(conn, propagations)
+        build = kb.get_task(conn, build_id)
+        assert build is not None and build.status == "done"
+
+
+# ---------------------------------------------------------------------------
+# FIX [audit #5]: a 0-action sweep must be distinguishable from a converged
+# board. detect_stalls() surfaces review-required-blocked cards with no open
+# gate (frozen, awaiting a human) vs. a genuinely converged board.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_stalls_flags_frozen_review_required_with_only_a_done_gate(kanban_home):
+    with _conn() as conn:
+        assert sweep.detect_stalls(conn) == []  # empty board is converged, not stalled
+
+        build_id = _mk_target(conn, title="Frozen build awaiting human")
+        assert kb.block_task(conn, build_id, reason="review-required: awaiting gate", kind="needs_input")
+        # A gate that already ran and is DONE (BLOCK) is not an OPEN gate.
+        gate_id = kb.create_task(
+            conn,
+            title="Ready gate: frozen build",
+            body=f"Review target `{build_id}`",
+            assignee="gatewarden",
+            created_by="missioncommander",
+            board=sweep.BOARD,
+        )
+        assert kb.complete_task(
+            conn, gate_id, summary="BLOCK: missing evidence", metadata={"verdict": "BLOCK", "target_task": build_id}
+        )
+
+        stalls = sweep.detect_stalls(conn)
+        assert [s["task_id"] for s in stalls] == [build_id]
+        assert stalls[0]["lineage_root"] == build_id
+
+
+def test_detect_stalls_ignores_card_with_an_open_gate(kanban_home):
+    with _conn() as conn:
+        build_id = _mk_target(conn, title="Build under active review")
+        assert kb.block_task(conn, build_id, reason="review-required: awaiting gate", kind="needs_input")
+        # A non-terminal (todo/ready/running) gate referencing the card -> not stalled.
+        kb.create_task(
+            conn,
+            title="Ready gate: active review",
+            body=f"Review target `{build_id}`",
+            assignee="gatewarden",
+            created_by="missioncommander",
+            board=sweep.BOARD,
+        )
+        assert sweep.detect_stalls(conn) == []
