@@ -35,8 +35,9 @@ GATEWARDEN = sweep.GATEWARDEN
 def _state_path() -> Path:
     # Resolved at call time so it follows HERMES_HOME / Path.home() (test isolation).
     return Path.home() / ".hermes" / "mission-engine" / "closeout-digests.json"
-# Default target: the watchdog thread where this lane was launched. Override with --target.
-DEFAULT_TARGET = "discord:1523026906075762841:1523026906075762841"
+# Default target: the #clawta channel (same channel D015 and the sweep cron use).
+# Override with --target (e.g. a specific mission thread). Format: discord:<channel_id>[:<thread_id>].
+DEFAULT_TARGET = "discord:1508984141197213728"
 
 # Sub-work cards (gates, cures, re-gates) are never mission origins; they are the
 # machinery of a mission, not a mission closeout.
