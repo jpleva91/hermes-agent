@@ -78,6 +78,367 @@ def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
     assert row[0] == 123456
 
 
+def test_mission_engine_board_rejects_retired_profile_assignment(kanban_home):
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        with pytest.raises(ValueError, match="active-cast preflight"):
+            kb.create_task(
+                conn,
+                title="Mission Engine fix: handoff guardrail",
+                assignee="systemsarchitect",
+                created_by="missioncommander",
+                board="fable-emulation-workflow",
+            )
+
+
+def test_mission_engine_preflight_uses_open_connection_board_when_global_default_differs(
+    kanban_home, monkeypatch
+):
+    """connect(board=mission) must enforce Spec 002 even without board= on mutators."""
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        with pytest.raises(ValueError, match="active-cast preflight"):
+            kb.create_task(
+                conn,
+                title="Mission Engine fix: explicit board identity",
+                assignee="systemsarchitect",
+                created_by="missioncommander",
+            )
+
+        tid = kb.create_task(
+            conn,
+            title="Mission Engine fix: explicit board identity",
+            assignee="runtimesteward",
+            created_by="missioncommander",
+        )
+        with pytest.raises(ValueError, match="active-cast preflight"):
+            kb.assign_task(conn, tid, "systemsarchitect")
+        with pytest.raises(ValueError, match="active-cast preflight"):
+            kb.reassign_task(conn, tid, "systemsarchitect")
+
+
+def test_non_mission_board_allows_project_specific_assignees(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+    with kb.connect(board="side-project") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Mission Engine fix: ordinary side-board tracking",
+            assignee="systemsarchitect",
+            created_by="missioncommander",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "systemsarchitect"
+        assert kb.assign_task(conn, tid, "retiredprofile")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "retiredprofile"
+        assert kb.reassign_task(conn, tid, "systemsarchitect")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "systemsarchitect"
+
+
+def test_mission_engine_board_allows_active_cast_assignment(kanban_home):
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Mission Engine fix: handoff guardrail",
+            assignee="runtimesteward",
+            created_by="missioncommander",
+            board="fable-emulation-workflow",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "runtimesteward"
+
+
+def test_mission_engine_goal_mode_mission_requires_commander_handoff(kanban_home):
+    body = "T2 mission: implement architecture changes with review and evidence."
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        with pytest.raises(ValueError, match="goal-mode handoff preflight"):
+            kb.create_task(
+                conn,
+                title="Build the T2 mission directly",
+                body=body,
+                assignee="codexoperator",
+                created_by="runtimesteward",
+                goal_mode=True,
+                board="fable-emulation-workflow",
+            )
+        tid = kb.create_task(
+            conn,
+            title="Mission Commander handoff: T2 mission intake",
+            body=body,
+            assignee="missioncommander",
+            created_by="runtimesteward",
+            goal_mode=True,
+            board="fable-emulation-workflow",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "missioncommander"
+
+
+def test_mission_engine_chat_direct_mission_requires_commander_handoff(kanban_home):
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        with pytest.raises(ValueError, match="goal-mode handoff preflight"):
+            kb.create_task(
+                conn,
+                title="Implement mission architecture",
+                body="Needs source packet, rehearsal, gate review, and evidence.",
+                assignee="codexoperator",
+                created_by="runtimesteward",
+                board="fable-emulation-workflow",
+            )
+        parent = kb.create_task(
+            conn,
+            title="Mission parent",
+            assignee="missioncommander",
+            created_by="runtimesteward",
+            board="fable-emulation-workflow",
+        )
+        child = kb.create_task(
+            conn,
+            title="Implement mission architecture",
+            body="Needs source packet, rehearsal, gate review, and evidence.",
+            assignee="codexoperator",
+            created_by="missioncommander",
+            parents=[parent],
+            board="fable-emulation-workflow",
+        )
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.assignee == "codexoperator"
+
+
+def test_mission_engine_cli_rejection_exits_nonzero_with_actionable_error(
+    kanban_home, monkeypatch, capsys
+):
+    """CLI shims should expose active-cast preflight failures as rc=2."""
+    import argparse
+
+    from hermes_cli import kanban as kb_cli
+
+    kb.create_board("fable-emulation-workflow")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "fable-emulation-workflow")
+
+    create_ns = argparse.Namespace(
+        title="Mission Engine fix: CLI guardrail",
+        body=None,
+        assignee="systemsarchitect",
+        created_by="missioncommander",
+        workspace="scratch",
+        tenant=None,
+        priority=0,
+        parent=None,
+        triage=False,
+        idempotency_key=None,
+        max_runtime=None,
+        skills=None,
+        json=False,
+    )
+    assert kb_cli._cmd_create(create_ns) == 2
+    assert "active-cast preflight" in capsys.readouterr().err
+
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Mission Engine fix: CLI guardrail target",
+            assignee="runtimesteward",
+            created_by="missioncommander",
+            board="fable-emulation-workflow",
+        )
+
+    assign_ns = argparse.Namespace(task_id=tid, profile="systemsarchitect")
+    assert kb_cli._cmd_assign(assign_ns) == 2
+    assert "active-cast preflight" in capsys.readouterr().err
+
+    reassign_ns = argparse.Namespace(
+        task_id=tid, profile="systemsarchitect", reclaim=False, reason=None
+    )
+    assert kb_cli._cmd_reassign(reassign_ns) == 2
+    assert "active-cast preflight" in capsys.readouterr().err
+
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee == "runtimesteward"
+
+
+def test_kanban_cli_entrypoint_preflight_errors_exit_nonzero(kanban_home, monkeypatch):
+    """The real `python -m hermes_cli.main` path must propagate handler rc=2."""
+    kb.create_board("fable-emulation-workflow")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "fable-emulation-workflow")
+
+    with kb.connect(board="fable-emulation-workflow") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Mission Engine fix: CLI entrypoint guardrail target",
+            assignee="runtimesteward",
+            created_by="missioncommander",
+            board="fable-emulation-workflow",
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root)
+
+    for verb in ("assign", "reassign"):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "kanban",
+                verb,
+                tid,
+                "systemsarchitect",
+            ],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 2
+        assert "active-cast preflight" in proc.stderr
+
+        with kb.connect(board="fable-emulation-workflow") as conn:
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "runtimesteward"
+
+
+def test_kanban_cli_entrypoint_preflight_honors_pinned_db_when_home_differs(
+    kanban_home, tmp_path, monkeypatch
+):
+    """A worker env may pin HERMES_KANBAN_DB while HERMES_HOME cannot see the board.
+
+    In that shape get_current_board() falls back to default, but mutators still
+    write the pinned board DB.  The preflight must classify the open DB path as
+    the Mission Engine board instead of trusting the fallback label.
+    """
+    board = "fable-emulation-workflow"
+    kb.create_board(board)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Mission Engine fix: CLI entrypoint return-code repro",
+            assignee="runtimesteward",
+            created_by="missioncommander",
+            board=board,
+        )
+    board_db = kb.kanban_db_path(board=board)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    child_home = tmp_path / "child-home" / ".hermes"
+    child_home.mkdir(parents=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(child_home),
+            "HERMES_KANBAN_BOARD": board,
+            "HERMES_KANBAN_DB": str(board_db),
+            "PYTHONPATH": str(repo_root),
+        }
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "assign",
+            tid,
+            "systemsarchitect",
+        ],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 2
+    assert "active-cast preflight" in proc.stderr
+
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee == "runtimesteward"
+
+
+def test_kanban_cli_entrypoint_preflight_prefers_pinned_db_over_stale_current_board(
+    kanban_home, tmp_path, monkeypatch
+):
+    """HERMES_KANBAN_DB must beat a child HERMES_HOME's stale current board.
+
+    Gate Warden found a real CLI bypass where the child home selected a
+    non-default ``side-project`` board while ``HERMES_KANBAN_DB`` pinned the
+    Mission Engine board DB.  ``assign``/``reassign`` passed the stale board
+    label into preflight and reassigned a Mission Engine card to a retired
+    profile.  The open sqlite DB path is authoritative in this shape.
+    """
+    board = "fable-emulation-workflow"
+    stale_board = "side-project"
+    kb.create_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Mission Engine fix: stale child current-board repro",
+            assignee="runtimesteward",
+            created_by="missioncommander",
+            board=board,
+        )
+    board_db = kb.kanban_db_path(board=board)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    child_home = tmp_path / "child-home-with-stale-current" / ".hermes"
+    (child_home / "kanban" / "boards" / stale_board).mkdir(parents=True)
+    (child_home / "kanban" / "boards" / stale_board / "board.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    (child_home / "kanban" / "current").write_text(stale_board + "\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env.pop("HERMES_KANBAN_BOARD", None)
+    env.update(
+        {
+            "HERMES_HOME": str(child_home),
+            "HERMES_KANBAN_DB": str(board_db),
+            "PYTHONPATH": str(repo_root),
+        }
+    )
+
+    for verb in ("assign", "reassign"):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "kanban",
+                verb,
+                tid,
+                "systemsarchitect",
+            ],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 2
+        assert "active-cast preflight" in proc.stderr
+
+        with kb.connect(board=board) as conn:
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "runtimesteward"
+
+
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
 
@@ -423,6 +784,52 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
         assert kb.schedule_task(conn, child, reason="second timer") is True
         assert kb.unblock_task(conn, child) is True
         assert kb.get_task(conn, child).status == "ready"
+
+
+def test_block_task_persists_reason_as_task_result(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs operator", assignee="ops")
+        claimed = kb.claim_task(conn, tid, claimer="test:worker")
+        assert claimed is not None
+
+        assert kb.block_task(conn, tid, reason="missing credential", kind="needs_input") is True
+
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.result == "missing credential"
+        assert run is not None
+        assert run.outcome == "blocked"
+        assert run.summary == "missing credential"
+
+
+def test_dependency_block_persists_reason_as_task_result(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="wait for parent", assignee="ops")
+
+        assert kb.block_task(conn, tid, reason="waiting on data load", kind="dependency") is True
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "todo"
+        assert task.result == "waiting on data load"
+        assert task.block_kind == "dependency"
+
+
+def test_block_loop_triage_persists_latest_reason_as_task_result(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="flaky blocker", assignee="ops")
+        assert kb.block_task(conn, tid, reason="still unauthorized", kind="capability") is True
+        assert kb.unblock_task(conn, tid) is True
+
+        assert kb.block_task(conn, tid, reason="still unauthorized", kind="capability") is True
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+        assert task.result == "still unauthorized"
+        assert task.block_kind == "capability"
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):

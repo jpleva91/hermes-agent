@@ -136,6 +136,180 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+# Spec 002 Mission Engine guardrail (D2-016/D2-017).  This is deliberately
+# scoped to the mission-ledger board so ordinary Kanban boards can keep using
+# arbitrary project-specific assignees.  The active cast comes from
+# ~/.hermes/specs/002-mission-engine/spec.md, but is duplicated here as a small
+# runtime preflight so stale on-disk profiles such as ``systemsarchitect`` do not
+# receive new mission cards just because ``hermes profile list`` can see them.
+MISSION_ENGINE_BOARD_SLUG = "fable-emulation-workflow"
+MISSION_ENGINE_COMMANDER = "missioncommander"
+MISSION_ENGINE_ACTIVE_CAST = frozenset({
+    "missioncommander",
+    "specsteward",
+    "sourcecartographer",
+    "claudecodeconductor",
+    "codexoperator",
+    "gatewarden",
+    "runtimesteward",
+})
+_MISSION_ENGINE_MISSION_SHAPED_RE = re.compile(
+    r"\b("
+    r"t[12]|mission|multi[- ]?step|implement|implementation|architecture|"
+    r"product behavior|user[- ]visible|source packet|rehearsal|review|gate|"
+    r"evidence|delegate_task|background agent|deploy|release|closeout"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _mission_engine_board_active(board: Optional[str] = None) -> bool:
+    try:
+        resolved = _normalize_board_slug(board) if board else get_current_board()
+    except Exception:
+        return False
+    return resolved == MISSION_ENGINE_BOARD_SLUG
+
+
+def _mission_engine_is_mission_shaped(title: str, body: Optional[str]) -> bool:
+    haystack = f"{title or ''}\n{body or ''}"
+    return bool(_MISSION_ENGINE_MISSION_SHAPED_RE.search(haystack))
+
+
+def _board_slug_from_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Best-effort canonical board slug for an already-open connection.
+
+    Mutators receive a sqlite connection, and some callers open that connection
+    with ``connect(board=...)`` before calling lower-level helpers. In that
+    shape the process-global current-board chain may point somewhere else, so
+    preflight checks must prefer the DB file that is actually being mutated.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except Exception:
+        return None
+    main_path: Optional[Path] = None
+    for row in rows:
+        try:
+            name = row[1]
+            filename = row[2]
+        except Exception:
+            try:
+                name = row["name"]
+                filename = row["file"]
+            except Exception:
+                continue
+        if name == "main" and filename:
+            main_path = Path(str(filename)).expanduser()
+            break
+    if main_path is None:
+        return None
+    resolved = main_path.resolve()
+    try:
+        if resolved == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+        root = boards_root().resolve()
+        rel = resolved.relative_to(root)
+        parts = rel.parts
+        if len(parts) == 2 and parts[1] == "kanban.db":
+            try:
+                return _normalize_board_slug(parts[0])
+            except ValueError:
+                return None
+    except Exception:
+        pass
+
+    # A worker or repro may inherit HERMES_KANBAN_DB pointing at another Hermes
+    # root while HERMES_HOME/HERMES_KANBAN_HOME points somewhere temporary.  In
+    # that case the configured boards_root() comparison above cannot work, but
+    # the canonical board DB layout is still self-describing:
+    #   .../kanban/boards/<slug>/kanban.db
+    parts = resolved.parts
+    for idx in range(len(parts) - 3):
+        if parts[idx] == "kanban" and parts[idx + 1] == "boards" and parts[idx + 3] == "kanban.db":
+            try:
+                return _normalize_board_slug(parts[idx + 2])
+            except ValueError:
+                return None
+    return None
+
+
+def _authoritative_board_for_connection(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+) -> Optional[str]:
+    """Return the board actually being mutated.
+
+    ``HERMES_KANBAN_DB`` is a path-level pin used by dispatcher-spawned workers
+    and test/repro scripts.  Because :func:`kanban_db_path` honors that pin even
+    when callers pass ``board=DEFAULT_BOARD``, a stale/fallback board label can
+    otherwise mask the non-default DB that the connection really targets.  Prefer
+    non-default inference from the open sqlite file whenever the caller's label is
+    absent or merely the default fallback.
+    """
+    inferred = _board_slug_from_connection(conn)
+
+    # When HERMES_KANBAN_DB pins a concrete DB file, path resolution opens that
+    # file regardless of any stale current-board label the caller passed through
+    # ``board``.  In that mode the sqlite connection is the source of truth: a
+    # child HERMES_HOME may say ``side-project`` while the inherited DB pin is
+    # actually mutating the Mission Engine board.
+    if os.environ.get("HERMES_KANBAN_DB", "").strip() and inferred:
+        return inferred
+
+    if board is None:
+        return inferred
+    try:
+        normed = _normalize_board_slug(board) or DEFAULT_BOARD
+    except ValueError:
+        return inferred or board
+    if normed == DEFAULT_BOARD and inferred and inferred != DEFAULT_BOARD:
+        return inferred
+    return normed
+
+
+def _validate_mission_engine_card_preflight(
+    *,
+    board: Optional[str],
+    title: str,
+    body: Optional[str],
+    assignee: Optional[str],
+    created_by: Optional[str] = None,
+    goal_mode: bool = False,
+    parents: Iterable[str] = (),
+) -> None:
+    """Enforce the narrow Spec 002 mission-card minting invariants.
+
+    Guardrails:
+    - Active-cast only for new/reassigned cards on the Mission Engine board.
+    - Goal-mode/non-commander chat intake must hand mission-shaped T1/T2 work to
+      Mission Commander instead of directly spawning an implementation lane.
+    """
+
+    if not _mission_engine_board_active(board):
+        return
+    if assignee and assignee not in MISSION_ENGINE_ACTIVE_CAST:
+        raise ValueError(
+            "Spec 002 active-cast preflight rejected assignee "
+            f"{assignee!r}: active mission cards may target only "
+            f"{', '.join(sorted(MISSION_ENGINE_ACTIVE_CAST))}; retired or "
+            "non-canonical profiles (for example systemsarchitect) must not "
+            "receive new Mission Engine cards"
+        )
+    if assignee == MISSION_ENGINE_COMMANDER:
+        return
+    if not _mission_engine_is_mission_shaped(title, body):
+        return
+    creator = (created_by or "").strip()
+    parent_list = tuple(p for p in parents if p)
+    if goal_mode or (creator and creator != MISSION_ENGINE_COMMANDER and not parent_list):
+        raise ValueError(
+            "Spec 002 goal-mode handoff preflight rejected mission-shaped "
+            "work outside Mission Commander: T1/T2 goal-mode/chat intake "
+            "must create/request a Mission Commander handoff card and stop "
+            "before implementation"
+        )
+
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
@@ -2489,7 +2663,17 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
+    authoritative_board = _authoritative_board_for_connection(conn, board)
     parents = tuple(p for p in parents if p)
+    _validate_mission_engine_card_preflight(
+        board=authoritative_board,
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        goal_mode=goal_mode,
+        parents=parents,
+    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2567,7 +2751,7 @@ def create_task(
         and project_repo is None
         and workspace_kind in {"dir", "worktree"}
     ):
-        board_slug = board if board else get_current_board()
+        board_slug = authoritative_board if authoritative_board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default:
@@ -2773,7 +2957,13 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    board: Optional[str] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -2782,10 +2972,16 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, title, body FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
+        _validate_mission_engine_card_preflight(
+            board=_authoritative_board_for_connection(conn, board),
+            title=row["title"] or "",
+            body=row["body"],
+            assignee=profile,
+        )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -3819,6 +4015,7 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -3836,7 +4033,7 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(conn, task_id, profile, board=board)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -4603,6 +4800,7 @@ def block_task(
                 """
                 UPDATE tasks
                    SET status        = 'todo',
+                       result        = ?,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -4610,8 +4808,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (reason, kind, task_id) if expected_run_id is None
+                else (reason, kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -4656,6 +4854,7 @@ def block_task(
                 """
                 UPDATE tasks
                    SET status        = 'triage',
+                       result        = ?,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -4664,8 +4863,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (reason, kind, recurrences, task_id) if expected_run_id is None
+                else (reason, kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -4695,6 +4894,7 @@ def block_task(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
+                           result        = ?,
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -4703,13 +4903,14 @@ def block_task(
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (reason, kind, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
+                           result        = ?,
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -4719,7 +4920,7 @@ def block_task(
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (reason, kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False

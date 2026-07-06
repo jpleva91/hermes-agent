@@ -787,6 +787,82 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     return bool(mt)
 
 
+_MISSION_CONTROL_WHAT_NEXT_RE = re.compile(
+    r"\b(?:what(?:'|’)s|what\s+is|what)\s+(?:the\s+)?next\b"
+    r"|\bwhat\s+should\s+(?:i|we)\s+do\s+next\b"
+    r"|\bnext\s+action\b"
+    r"|\bwhat\s+now\b",
+    re.IGNORECASE,
+)
+
+_MISSION_CONTROL_CONTEXT_RE = re.compile(
+    r"\b("
+    r"mission\s+control|mission\s+engine|fable|clawta|readybench|"
+    r"agentic\s+sdlc|what'?s[-\s]*next[-\s]*heartbeat|"
+    r"fable[-\s]*emulation[-\s]*workflow|notebooklm|notebook\s+lm"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _mission_control_what_next_guard_prompt(
+    message: object,
+    *,
+    source: object = None,
+    channel_prompt: Optional[str] = None,
+) -> Optional[str]:
+    """Return the deterministic Mission Control/Fable guard for relevant turns.
+
+    This narrow preflight fires only when the user asks a "what's next" style
+    question and the user text or current session metadata names Jared's Mission
+    Control/Fable lane. Metadata is used only as a routing signal; the guard
+    requires fresh tool-backed state before acting.
+    """
+    if not isinstance(message, str):
+        return None
+    text = message.strip()
+    if not text or not _MISSION_CONTROL_WHAT_NEXT_RE.search(text):
+        return None
+
+    context_parts = [text, channel_prompt or ""]
+    if source is not None:
+        for attr in (
+            "chat_name",
+            "chat_topic",
+            "chat_type",
+            "platform",
+            "thread_id",
+            "parent_chat_id",
+            "profile",
+        ):
+            value = getattr(source, attr, None)
+            if value:
+                context_parts.append(str(getattr(value, "value", value)))
+        try:
+            desc = getattr(source, "description", None)
+            if desc:
+                context_parts.append(str(desc))
+        except Exception:
+            pass
+
+    if not _MISSION_CONTROL_CONTEXT_RE.search("\n".join(context_parts)):
+        return None
+
+    return """## Mission Control / Fable runtime guard
+
+This turn matched a Mission Control/Fable/ReadyBench “what's next” preflight.
+Before giving the final answer, you MUST treat this as Mission Engine intake, not generic chat:
+
+1. You must inspect the relevant Kanban board/workflow state first (default board: `fable-emulation-workflow` when the thread/context does not name a narrower board).
+2. Check watcher/heartbeat/closeout state when deciding next action; do not make the user manually invoke the watcher.
+3. Route mission-shaped build/verification work through the Fable/Claude-first ladder unless the user explicitly downgrades it; if you downgrade, state the lane/capability loss and verification plan.
+4. Persist durable mission conclusions/evidence to Obsidian when the work produces an operational decision or audit result.
+5. Consider NotebookLM when the mission depends on notebook-backed research/synthesis; if NotebookLM is unavailable, say so and use a bounded fallback.
+6. Final response must be evidence-first: current board/watcher facts, the chosen next action, lane/assignee, and any blocked dependency.
+
+Do not satisfy this turn with a passive answer from memory alone."""
+
+
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]],
     *,
@@ -17211,6 +17287,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cfg_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+            mission_guard_context_prompt = "\n\n".join(
+                part for part in (event_channel_prompt, cfg_channel_prompt or "") if part
+            )
+            mission_guard_prompt = _mission_control_what_next_guard_prompt(
+                message,
+                source=source,
+                channel_prompt=mission_guard_context_prompt,
+            )
+            if mission_guard_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + mission_guard_prompt).strip()
+                logger.info(
+                    "Mission Control/Fable what-next guard injected for session %s",
+                    session_key,
+                )
 
             max_iterations = _current_max_iterations()
 

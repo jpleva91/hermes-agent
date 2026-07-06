@@ -450,6 +450,32 @@ def test_patch_reassign(client):
     assert r.json()["task"]["assignee"] == "b"
 
 
+def test_mission_board_dashboard_reassign_preflight_uses_query_board(client, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    kb.create_board("fable-emulation-workflow")
+    task = client.post(
+        "/api/plugins/kanban/tasks?board=fable-emulation-workflow",
+        json={
+            "title": "Routine dashboard handoff guardrail",
+            "assignee": "runtimesteward",
+        },
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}?board=fable-emulation-workflow",
+        json={"assignee": "systemsarchitect"},
+    )
+    assert r.status_code == 400
+    assert "active-cast preflight" in r.json()["detail"]
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/reassign?board=fable-emulation-workflow",
+        json={"profile": "systemsarchitect"},
+    )
+    assert r.status_code == 400
+    assert "active-cast preflight" in r.json()["detail"]
+
+
 def test_patch_priority_and_edit(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(

@@ -145,14 +145,30 @@ def _deliver(text: str, target: str) -> dict:
     """Post via the sanctioned send path. Imported lazily so dry-run/tests need no gateway deps."""
     from tools.send_message_tool import send_message_tool
 
-    return send_message_tool({"action": "send", "target": target, "message": text})
+    result = send_message_tool({"action": "send", "target": target, "message": text})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            return {"error": result}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"success": bool(parsed), "result": parsed}
+    return {"success": bool(result), "result": result}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mission Engine closeout digest → Discord")
     parser.add_argument("--board", default=BOARD)
     parser.add_argument("--init", action="store_true", help="Seed baseline from current done cards; send nothing.")
-    parser.add_argument("--send", action="store_true", help="Deliver new closeouts to Discord. Omit for dry-run.")
+    parser.add_argument("--send", action="store_true", help="Deliver new closeouts to Discord directly. Omit for dry-run.")
+    parser.add_argument(
+        "--emit",
+        action="store_true",
+        help="Print new closeouts to stdout and mark them digested; intended for no_agent cron delivery.",
+    )
     parser.add_argument("--target", default=DEFAULT_TARGET, help="Discord send target (discord:channel:thread).")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -186,22 +202,29 @@ def main(argv: list[str] | None = None) -> int:
             entry["send_result"] = res
             if res.get("success"):
                 digested.add(row["id"])
+        elif args.emit:
+            entry["emitted"] = True
+            entry["digest"] = text
+            digested.add(row["id"])
         else:
             entry["digest"] = text
         results.append(entry)
 
-    if args.send:
+    if args.send or args.emit:
         state["digested"] = sorted(digested)
         _save_state(state)
 
     out = {
-        "mode": "send" if args.send else "dry-run",
+        "mode": "send" if args.send else "emit" if args.emit else "dry-run",
         "board": BOARD,
         "new_closeouts": len(closeouts),
         "results": results,
     }
     if args.json:
         print(json.dumps(out, indent=2, sort_keys=True))
+    elif args.emit:
+        if closeouts:
+            print("\n\n---\n\n".join(str(e["digest"]) for e in results))
     elif not closeouts:
         print("closeout digest: no new mission closeouts.")
     else:

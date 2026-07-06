@@ -13646,9 +13646,12 @@ def main():
         cmd_chat(args)
         return
 
-    # Execute the command
+    # Execute the command.  Subcommand handlers conventionally return integer
+    # process statuses (or None for success); propagate those statuses so CLI
+    # callers can rely on failures being visible to shells and supervisors.
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        sys.exit(result if result is not None else 0)
     else:
         parser.print_help()
 

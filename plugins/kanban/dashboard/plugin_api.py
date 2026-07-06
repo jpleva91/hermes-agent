@@ -616,6 +616,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            board=board,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -831,8 +832,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.assignee is not None:
             try:
                 ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
+                    conn, task_id, payload.assignee or None, board=board,
                 )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
             except RuntimeError as e:
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
@@ -1226,10 +1229,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             ok = kanban_db.reassign_task(
                                 conn, tid, payload.assignee or None,
                                 reclaim_first=True,
+                                board=board,
                             )
                         else:
                             ok = kanban_db.assign_task(
-                                conn, tid, payload.assignee or None,
+                                conn, tid, payload.assignee or None, board=board,
                             )
                         if not ok:
                             entry.update(ok=False, error="assign refused")
@@ -1664,12 +1668,16 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reassign_task(
-            conn, task_id,
-            payload.profile or None,
-            reclaim_first=bool(payload.reclaim_first),
-            reason=payload.reason,
-        )
+        try:
+            ok = kanban_db.reassign_task(
+                conn, task_id,
+                payload.profile or None,
+                reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason,
+                board=board,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if not ok:
             raise HTTPException(
                 status_code=409,
