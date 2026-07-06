@@ -25,7 +25,9 @@ from hermes_cli import kanban_db as kb  # noqa: E402
 BOARD = "fable-emulation-workflow"
 AUTHOR = "missioncommander"
 GATEWARDEN = "gatewarden"
-EVIDENCE_CONTRACT = "/home/red/.hermes/specs/002-mission-engine/evidence-contract.md"
+SPEC_KIT_PACKET = "/home/red/.hermes/specs/002-mission-engine/spec.md"
+SOURCE_PACKET = "/home/red/.hermes/specs/002-mission-engine/evidence-contract.md"
+EVIDENCE_CONTRACT = SOURCE_PACKET
 ACTIVE_CAST = {
     "missioncommander",
     "specsteward",
@@ -457,6 +459,8 @@ Gate BLOCK evidence excerpt:
 {excerpt}
 
 Acceptance:
+- Spec Kit: `{SPEC_KIT_PACKET}`.
+- Source packet: `{SOURCE_PACKET}`.
 - Cure the exact BLOCK findings from `{gate['id']}`.
 - Include raw evidence required by `{EVIDENCE_CONTRACT}`: diff/files or source refs, copy-pasteable repro commands, test/check output, and side-effect declaration.
 - No merge/promote/deploy/external side effects unless Jared explicitly authorizes.
@@ -478,6 +482,8 @@ Dependency doctrine:
   missing evidence rather than waiting on a graph dependency.
 
 Required verification:
+- Spec Kit: `{SPEC_KIT_PACKET}`.
+- Source packet: `{SOURCE_PACKET}`.
 - Review the cure card `{cure_id}` and original BLOCK `{gate['id']}`.
 - Verify the cure against raw evidence requirements in `{EVIDENCE_CONTRACT}`.
 - Run at least one reviewer-side repro/check for T1/T2 work; do not approve summaries alone.
@@ -509,6 +515,8 @@ Target:
 - Review-required reason: {reason}
 
 Required verification:
+- Spec Kit: `{SPEC_KIT_PACKET}`.
+- Source packet: `{SOURCE_PACKET}`.
 - Apply `{EVIDENCE_CONTRACT}`.
 - Run at least one reviewer-side repro/check for T1/T2 work.
 - APPROVE only with raw evidence refs; BLOCK with exact remediation if evidence/scope/checks fail.
