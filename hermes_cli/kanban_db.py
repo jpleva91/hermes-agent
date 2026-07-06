@@ -4436,13 +4436,50 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return False
 
 
+def _workspace_shared_with_active_task(
+    conn: sqlite3.Connection, task_id: str, path: str
+) -> bool:
+    """True if another non-terminal task points at the same workspace path.
+
+    Rework-program P0: cleanup used to be reference-blind — siblings sharing a
+    lineage workspace (e.g. children pinned to their parent's scratch dir)
+    could have it deleted out from under them by whichever task completed
+    first. Deletion is deferred until no live task references the path; the
+    last referent's completion (or the parent-deferred pass) performs it.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE workspace_path = ? AND id != ? "
+        "AND status NOT IN ('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+        (path, task_id),
+    ).fetchone()
+    return row is not None
+
+
+def _archive_before_delete(conn: sqlite3.Connection, task_id: str, wp: Path) -> bool:
+    """Archive ``wp`` for ``task_id``; True licenses deletion (P0 fail-closed).
+
+    Archive-as-precondition: a verified manifest + tarball must land under the
+    hermes-runtime mission-artifacts area before ``rmtree`` is legal. Archive
+    failure returns False and the caller must preserve the workspace — a
+    silent archive failure makes deletion impossible, not evidence loss
+    possible. ``HERMES_ARCHIVE_ON_COMPLETE=0`` restores legacy deletion.
+    """
+    from hermes_cli import mission_artifacts as _ma
+
+    if not _ma.archive_enabled():
+        return True
+    board = _board_slug_from_connection(conn) or "unknown-board"
+    return _ma.archive_workspace(board, task_id, wp, home=kanban_home())
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's scratch workspace dir and kill its stale tmux session.
+    """Archive then remove a task's scratch workspace; kill stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
     Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    are intentionally preserved. Removal requires a verified archive first
+    (P0 fail-closed contract) and defers while any live task shares the path.
     """
     try:
         row = conn.execute(
@@ -4484,15 +4521,25 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # pointing at a real source tree. Without this check, task
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
-            else:
+            if not _is_managed_scratch_path(wp):
                 _log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
                     "(workspace_kind='scratch' but path is outside any "
                     "kanban-managed workspaces root)",
                     task_id, wp,
+                )
+            elif _workspace_shared_with_active_task(conn, task_id, path):
+                _log.debug(
+                    "Deferring scratch workspace cleanup for task %s: another "
+                    "live task shares workspace %s", task_id, wp,
+                )
+            elif _archive_before_delete(conn, task_id, wp):
+                shutil.rmtree(wp, ignore_errors=True)
+                _log.debug("Removed scratch workspace (archived first): %s", wp)
+            else:
+                _log.warning(
+                    "Preserving workspace for task %s: archive failed, deletion "
+                    "refused (P0 fail-closed): %s", task_id, wp,
                 )
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
@@ -4539,8 +4586,16 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                if _workspace_shared_with_active_task(conn, parent_id, row["workspace_path"]):
+                    continue  # another live task still references this path
+                if _archive_before_delete(conn, parent_id, wp):
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _log.debug("Deferred cleanup: removed parent %s scratch workspace (archived first): %s", parent_id, wp)
+                else:
+                    _log.warning(
+                        "Deferred cleanup: preserving parent %s workspace, archive "
+                        "failed (P0 fail-closed): %s", parent_id, wp,
+                    )
     except Exception:
         pass  # best-effort
 
