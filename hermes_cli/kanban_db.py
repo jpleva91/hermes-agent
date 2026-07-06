@@ -1427,6 +1427,60 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Rework program P2: structured verdicts. Coordination state as schema, not
+-- comment prose scraped by regex. Written ONLY via record_verdict() which is
+-- fail-closed at APPROVE (evidence manifest paths + sha256 verified against
+-- the P0 archive). WAIVED requires waive_authority (a Jared packet ref) —
+-- no LLM principal can waive. cross_model is computed from dispatcher-recorded
+-- run lane data, never caller-asserted.
+CREATE TABLE IF NOT EXISTS task_verdicts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL,
+    run_id          INTEGER,
+    target_task_id  TEXT NOT NULL,
+    verdict         TEXT NOT NULL CHECK (verdict IN ('APPROVE','NEEDS_WORK','REJECT','WAIVED')),
+    tier            TEXT,
+    evidence_manifest TEXT,
+    reviewer_model  TEXT,
+    cross_model     INTEGER NOT NULL DEFAULT 0,
+    waive_authority TEXT,
+    created_at      INTEGER NOT NULL
+);
+
+-- Rework program P4: reconciler mint idempotency. A repair card may be minted
+-- only after INSERTing its defect fingerprint here — the UNIQUE constraint
+-- turns the July-4 cure/re-gate generator (130 cards/4h) into an IntegrityError.
+CREATE TABLE IF NOT EXISTS defect_fingerprints (
+    lineage_root TEXT NOT NULL,
+    fingerprint  TEXT NOT NULL,
+    card_id      TEXT,
+    created_at   INTEGER NOT NULL,
+    UNIQUE(lineage_root, fingerprint)
+);
+
+-- Rework program P6: shadow log for policy_stamp trigger backstop.
+CREATE TABLE IF NOT EXISTS policy_violations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,
+    table_name TEXT,
+    op         TEXT,
+    task_id    TEXT,
+    detail     TEXT
+);
+
+-- Rework program P1: heartbeat ledger (used on the engine-health board DB).
+-- THE RENDERING RULE: next_beat_due < now == FAILURE regardless of status —
+-- a component's own 'ok' claim is never trusted over the clock.
+CREATE TABLE IF NOT EXISTS cron_heartbeats (
+    component     TEXT PRIMARY KEY,
+    last_beat     INTEGER NOT NULL,
+    next_beat_due INTEGER NOT NULL,
+    status        TEXT,
+    detail        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_verdicts_task   ON task_verdicts(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_verdicts_target ON task_verdicts(target_task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1897,6 +1951,7 @@ def connect(
         except Exception:
             conn.close()
             raise
+        refresh_policy_stamp(conn)  # rework P6: no-op unless triggers installed
         return conn
 
     with _cross_process_init_lock(path):
@@ -1945,6 +2000,7 @@ def connect(
         except Exception:
             conn.close()
             raise
+    refresh_policy_stamp(conn)  # rework P6: no-op unless triggers installed
     return conn
 
 
@@ -2260,6 +2316,58 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
+
+    # Rework program (P1/P2/P6) additive columns. All nullable — legacy rows
+    # and legacy writers keep working; enforcement lives in code paths that
+    # check them, each behind its own WARN-mode burn-in.
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "wake_deadline" not in cols:
+        # P1: every blocked card gets a wake deadline stamped at block time;
+        # the dispatch tick evaluates it as an invariant (no separate process
+        # to die). NULL = pre-rework block, evaluated with kind defaults.
+        _add_column_if_missing(conn, "tasks", "wake_deadline", "wake_deadline INTEGER")
+    if "needs_work_count" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "needs_work_count",
+            "needs_work_count INTEGER NOT NULL DEFAULT 0",
+        )
+    if "side_effect_class" not in cols:
+        # P6 floor: deploy/merge/send/spend cards cannot reach done without an
+        # APPROVE verdict row, no dial level can waive (constitutional floor).
+        _add_column_if_missing(
+            conn, "tasks", "side_effect_class",
+            "side_effect_class TEXT CHECK (side_effect_class IN "
+            "('deploy','merge','send','spend') OR side_effect_class IS NULL)",
+        )
+    if "origin" not in cols:
+        _add_column_if_missing(conn, "tasks", "origin", "origin TEXT")
+    if "mission_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "mission_id", "mission_id TEXT")
+    if "closeout_targets" not in cols:
+        # Orchestrator-granted (mint-time) allowlist of foreign task ids this
+        # card's worker may close — the scoped cross-task closeout path that
+        # replaces the card-per-bookkeeping tax. Never worker-claimable.
+        _add_column_if_missing(
+            conn, "tasks", "closeout_targets", "closeout_targets TEXT"
+        )
+
+    # P1: cost/lane accounting — dispatcher-recorded, the substrate for
+    # cost-per-receipt and for computing cross_model honestly. Guarded on
+    # table existence: a partially-created legacy DB may not have task_runs
+    # yet (executescript will create it with the full column set).
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone():
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        for name, ddl in (
+            ("model", "model TEXT"),
+            ("tokens_in", "tokens_in INTEGER"),
+            ("tokens_out", "tokens_out INTEGER"),
+            ("cost_usd", "cost_usd REAL"),
+            ("review_mode", "review_mode TEXT"),
+        ):
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, ddl)
 
     _rebuild_drifted_tables(conn)
 
@@ -4202,6 +4310,44 @@ def complete_task(
     """
     now = int(time.time())
 
+    # Rework P6 floor: a side_effect_class card (deploy/merge/send/spend)
+    # cannot reach done without an APPROVE verdict row targeting it. WARN-mode
+    # burn-in by default (HERMES_SIDE_EFFECT_ENFORCE=enforce flips fail-closed);
+    # the floor itself (which classes need Jared vs cross-model) lives in
+    # constitutional_floor.check at the CLI/tool layer.
+    try:
+        _floor_row = conn.execute(
+            "SELECT side_effect_class, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        _floor_row = None
+    if _floor_row is not None and _floor_row["side_effect_class"]:
+        try:
+            _has_approve = conn.execute(
+                "SELECT 1 FROM task_verdicts WHERE target_task_id = ? "
+                "AND verdict IN ('APPROVE','WAIVED') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            _has_approve = None
+        if not _has_approve:
+            _mode = (os.environ.get("HERMES_SIDE_EFFECT_ENFORCE") or "warn").strip().lower()
+            if _mode == "enforce":
+                raise ValueError(
+                    f"completion floor: side_effect_class="
+                    f"{_floor_row['side_effect_class']!r} requires an APPROVE "
+                    "verdict row (fail-closed; no dial level can waive)"
+                )
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "side_effect_floor_warn",
+                    {
+                        "would_have_blocked": True,
+                        "side_effect_class": _floor_row["side_effect_class"],
+                    },
+                )
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -4284,6 +4430,24 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        # Rework P1: cost/lane accounting. Workers report usage via metadata
+        # keys; they land as first-class run columns so cost-per-receipt and
+        # cross_model are queryable, not archaeology.
+        if run_id is not None and isinstance(metadata, dict):
+            _cost_updates = {}
+            for _k in ("model", "tokens_in", "tokens_out", "cost_usd", "review_mode"):
+                if metadata.get(_k) is not None:
+                    _cost_updates[_k] = metadata[_k]
+            if _cost_updates:
+                try:
+                    conn.execute(
+                        "UPDATE task_runs SET "
+                        + ", ".join(f"{k} = ?" for k in _cost_updates)
+                        + " WHERE id = ?",
+                        (*_cost_updates.values(), run_id),
+                    )
+                except sqlite3.OperationalError:
+                    pass  # pre-migration DB
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
@@ -4315,6 +4479,65 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+    # Rework P3: provably-fair audit lottery (C-graft). On review-lane boards
+    # with a board_salt, ~20% of ordinary completions get a deterministic,
+    # non-blocking post-hoc audit card: selection = sha256(task_id+salt), so
+    # workers can't predict it, wardens can't dodge it, and any third party
+    # can recompute that exactly the declared fraction was audited.
+    try:
+        _lottery_meta = read_board_metadata(_board_slug_from_connection(conn))
+        _salt = (_lottery_meta or {}).get("board_salt")
+        if (
+            _salt
+            and (_lottery_meta or {}).get("review_lane")
+            and _floor_row is not None
+        ):
+            _origin_row = conn.execute(
+                "SELECT origin, title, assignee FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            _is_meta_card = bool(
+                _origin_row
+                and (
+                    (_origin_row["origin"] or "") in ("lottery", "gate")
+                    or (_origin_row["assignee"] or "") == "gatewarden"
+                )
+            )
+            if not _is_meta_card:
+                import hashlib as _hl
+
+                _draw = int(_hl.sha256(f"{task_id}{_salt}".encode()).hexdigest(), 16)
+                if _draw / float(1 << 256) < 0.20:
+                    try:
+                        _audit_id = create_task(
+                            conn,
+                            title=f"Lottery audit: {(_origin_row['title'] or task_id)[:80]}",
+                            body=(
+                                f"Deterministic 20% post-hoc audit of {task_id} "
+                                f"(seed sha256(task_id+board_salt); selection "
+                                f"verifiable in the receipt). Verify the archived "
+                                f"evidence under mission-artifacts and record a "
+                                f"structured verdict via `hermes kanban verdict` "
+                                f"targeting {task_id}. Non-blocking: the audited "
+                                f"card is already done; a NEEDS_WORK/REJECT here "
+                                f"escalates per rework P3."
+                            ),
+                            assignee=(_lottery_meta or {}).get(
+                                "audit_reviewer", "gatewarden"
+                            ),
+                            created_by="lottery",
+                            parents=(task_id,),
+                            initial_status="running",
+                            idempotency_key=f"lottery-audit:{task_id}",
+                        )
+                        _append_event(
+                            conn, task_id, "lottery_audit_minted",
+                            {"audit_card": _audit_id},
+                        )
+                    except Exception as _lex:  # noqa: BLE001
+                        _log.debug("lottery mint skipped for %s: %s", task_id, _lex)
+    except Exception:  # noqa: BLE001 — lottery must never block completion
+        pass
+
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -4819,6 +5042,15 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Rework P3: on review-lane boards, finished work requesting review is a
+    # STATE TRANSITION (running -> review), not a terminal block plus a
+    # separately minted gate card. Legacy boards fall through to blocked.
+    if (reason or "").strip().lower().startswith(_REVIEW_REQUIRED_PREFIX):
+        try:
+            if route_review_required(conn, task_id, reason):
+                return True
+        except Exception as exc:  # noqa: BLE001 — legacy path must survive
+            _log.warning("review-lane routing failed for %s: %s", task_id, exc)
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -4872,6 +5104,7 @@ def block_task(
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
             routed_to = "todo"
+            _stamp_wake_deadline(conn, task_id, kind, reason)
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -4987,6 +5220,7 @@ def block_task(
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
+        _stamp_wake_deadline(conn, task_id, kind, reason)
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -4998,6 +5232,510 @@ def block_task(
     )
     return True
 
+
+# ---------------------------------------------------------------------------
+# Rework program P1/P2: wake deadlines + structured verdicts
+# ---------------------------------------------------------------------------
+
+#: Stall SLOs per block kind (seconds) — stamped at block time, evaluated as
+#: an invariant inside the dispatch tick (P1). review-required gets its own
+#: budget via the reason prefix; needs_input waits a day before packet nag.
+WAKE_DEADLINE_DEFAULTS = {
+    "dependency": 3600,
+    "transient": 7200,
+    "needs_input": 86400,
+    "capability": 86400,
+    None: 86400,
+}
+_REVIEW_REQUIRED_PREFIX = "review-required"
+_REVIEW_WAKE_SECONDS = 7200
+
+VALID_VERDICTS = {"APPROVE", "NEEDS_WORK", "REJECT", "WAIVED"}
+
+#: NEEDS_WORK bounces before auto-escalation to a human packet (P3).
+NEEDS_WORK_ESCALATION_LIMIT = 3
+
+
+def _stamp_wake_deadline(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: Optional[str],
+    reason: Optional[str],
+) -> None:
+    """Stamp ``wake_deadline`` on a just-blocked task (best-effort).
+
+    P1: silence must never be ambiguous — every blocked card carries the
+    timestamp after which its stall is a reportable failure, evaluated by
+    the dispatch tick (no separate process that can die).
+    """
+    try:
+        if (reason or "").strip().lower().startswith(_REVIEW_REQUIRED_PREFIX):
+            budget = _REVIEW_WAKE_SECONDS
+        else:
+            budget = WAKE_DEADLINE_DEFAULTS.get(kind, WAKE_DEADLINE_DEFAULTS[None])
+        conn.execute(
+            "UPDATE tasks SET wake_deadline = ? WHERE id = ?",
+            (int(time.time()) + budget, task_id),
+        )
+    except sqlite3.OperationalError:
+        pass  # pre-migration DB — column absent; tick treats NULL as legacy
+
+
+def _verdict_enforcement_mode() -> str:
+    """'warn' (default burn-in) or 'enforce' — HERMES_VERDICT_ENFORCE."""
+    raw = (os.environ.get("HERMES_VERDICT_ENFORCE") or "warn").strip().lower()
+    return "enforce" if raw == "enforce" else "warn"
+
+
+def _verify_evidence_manifest(
+    board: Optional[str], target_task_id: str, manifest: list
+) -> list:
+    """Return failure strings for manifest entries that don't verify.
+
+    Entries verify against the P0 archive for the target task
+    (mission-artifacts/<board>/<task>/): each {path, sha256} must name a file
+    in the archive manifest with a matching hash, or an absolute path that
+    exists with a matching hash. Reviewers review ARCHIVED bytes (B-graft).
+    """
+    import hashlib as _hashlib
+
+    from hermes_cli import mission_artifacts as _ma
+
+    failures: list = []
+    archive_manifest = None
+    try:
+        root = _ma.default_archive_root(kanban_home())
+        mpath = root / (board or "unknown-board") / target_task_id / _ma.MANIFEST_NAME
+        if mpath.is_file():
+            archive_manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    except Exception:
+        archive_manifest = None
+    archived = {
+        f["path"]: f["sha256"] for f in (archive_manifest or {}).get("files", [])
+    }
+    for entry in manifest or []:
+        p = str(entry.get("path", "")).strip()
+        want = str(entry.get("sha256", "")).strip().lower()
+        if not p or not want:
+            failures.append(f"manifest entry missing path/sha256: {entry!r}")
+            continue
+        if p in archived:
+            if archived[p].lower() != want:
+                failures.append(f"{p}: archive hash mismatch")
+            continue
+        fp = Path(p)
+        if fp.is_absolute() and fp.is_file():
+            try:
+                h = _hashlib.sha256(fp.read_bytes()).hexdigest()
+            except OSError as exc:
+                failures.append(f"{p}: unreadable ({exc})")
+                continue
+            if h.lower() != want:
+                failures.append(f"{p}: on-disk hash mismatch")
+            continue
+        failures.append(f"{p}: not in target archive and not an existing file")
+    return failures
+
+
+def record_verdict(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    verdict: str,
+    target_task_id: Optional[str] = None,
+    tier: Optional[str] = None,
+    evidence_manifest: Optional[list] = None,
+    run_id: Optional[int] = None,
+    waive_authority: Optional[str] = None,
+    reviewer_model: Optional[str] = None,
+    propagate: bool = True,
+) -> int:
+    """Write a structured verdict row (P2) and propagate it (P4).
+
+    Fail-closed contract:
+    * ``verdict`` must be one of :data:`VALID_VERDICTS`.
+    * ``WAIVED`` requires ``waive_authority`` (a Jared packet ref) — no LLM
+      principal can waive review. Structurally enforced, no env override.
+    * ``APPROVE`` verifies every evidence-manifest entry (path + sha256)
+      against the target's P0 archive. Failures raise in enforce mode;
+      in WARN mode (default burn-in, ``HERMES_VERDICT_ENFORCE=warn``) they
+      are logged as a ``verdict_evidence_warn`` event — would-have-blocked.
+    * ``cross_model`` is COMPUTED from dispatcher-recorded run lanes
+      (reviewing run's model vs the target's last work run's model), never
+      caller-asserted.
+
+    Propagation (synchronous consumer on the write path; the tick remains
+    backstop): APPROVE completes a target sitting in review/blocked;
+    NEEDS_WORK returns it to ready with ``needs_work_count++`` and
+    escalates to a needs_input block after 3 bounces.
+    """
+    verdict = (verdict or "").strip().upper()
+    if verdict not in VALID_VERDICTS:
+        raise ValueError(f"verdict must be one of {sorted(VALID_VERDICTS)}")
+    if verdict == "WAIVED":
+        if not (waive_authority or "").strip():
+            raise ValueError(
+                "WAIVED requires waive_authority (Jared packet ref) — "
+                "no LLM principal can waive review (constitutional floor F003)"
+            )
+        # Constitutional floor F003 (no kill-switch, by design): when the
+        # floor file is installed, its full semantics govern (hash-pinned;
+        # tamper/invalid = hard stop). Bootstrap installs without floor.yaml
+        # fall back to the structural non-empty-authority check above — the
+        # sentinel/census surface a missing floor as its own failure.
+        try:
+            from hermes_cli import constitutional_floor as _cf
+
+            if _cf.floor_path().is_file():
+                _cf.check("waive", {"waive_authority": waive_authority})
+        except (ImportError, AttributeError):
+            pass
+    target = (target_task_id or task_id).strip()
+    board = _board_slug_from_connection(conn) or get_current_board()
+
+    evidence_failures: list = []
+    if verdict == "APPROVE":
+        evidence_failures = _verify_evidence_manifest(
+            board, target, evidence_manifest or []
+        )
+        if not (evidence_manifest or []):
+            evidence_failures.append("APPROVE carries no evidence manifest")
+        if evidence_failures and _verdict_enforcement_mode() == "enforce":
+            raise ValueError(
+                "APPROVE evidence verification failed (fail-closed): "
+                + "; ".join(evidence_failures[:5])
+            )
+
+    # cross_model from dispatcher-recorded lane data only.
+    reviewer_lane = None
+    try:
+        if run_id is not None:
+            row = conn.execute(
+                "SELECT model FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            reviewer_lane = row["model"] if row else None
+        if reviewer_lane is None:
+            row = conn.execute(
+                "SELECT model FROM task_runs WHERE task_id = ? AND model IS NOT NULL "
+                "ORDER BY started_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            reviewer_lane = row["model"] if row else None
+        trow = conn.execute(
+            "SELECT model FROM task_runs WHERE task_id = ? AND model IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 1",
+            (target,),
+        ).fetchone()
+        target_lane = trow["model"] if trow else None
+    except sqlite3.OperationalError:
+        reviewer_lane, target_lane = None, None
+    else:
+        pass
+    cross_model = int(
+        bool(reviewer_lane) and bool(target_lane) and reviewer_lane != target_lane
+    )
+
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO task_verdicts (task_id, run_id, target_task_id, verdict,"
+            " tier, evidence_manifest, reviewer_model, cross_model,"
+            " waive_authority, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                run_id,
+                target,
+                verdict,
+                tier,
+                json.dumps(evidence_manifest or []),
+                reviewer_model or reviewer_lane,
+                cross_model,
+                (waive_authority or None),
+                now,
+            ),
+        )
+        verdict_id = int(cur.lastrowid)
+        _append_event(
+            conn, task_id, "verdict",
+            {
+                "verdict": verdict,
+                "target": target,
+                "cross_model": cross_model,
+                "evidence_entries": len(evidence_manifest or []),
+            },
+            run_id=run_id,
+        )
+        if evidence_failures:
+            _append_event(
+                conn, task_id, "verdict_evidence_warn",
+                {"would_have_blocked": True, "failures": evidence_failures[:10]},
+                run_id=run_id,
+            )
+
+    _fire_kanban_lifecycle_hook(
+        "kanban_verdict_recorded", task_id,
+        board=board, verdict=verdict, target_task_id=target,
+        cross_model=cross_model,
+    )
+
+    if propagate and (os.environ.get("HERMES_VERDICT_PROPAGATE") or "1") != "0":
+        _propagate_verdict(conn, verdict, target, task_id)
+    return verdict_id
+
+
+def _propagate_verdict(
+    conn: sqlite3.Connection, verdict: str, target: str, source_task_id: str
+) -> None:
+    """Apply a recorded verdict to its target's state (best-effort).
+
+    The synchronous half of the P4 verdict-propagation consumer. Any failure
+    leaves the verdict row durable for the reconciler/tick backstop — this
+    function must never raise.
+    """
+    try:
+        trow = conn.execute(
+            "SELECT status, needs_work_count FROM tasks WHERE id = ?", (target,)
+        ).fetchone()
+        if trow is None or target == source_task_id:
+            return
+        status = trow["status"]
+        if verdict in ("APPROVE", "WAIVED") and status in ("review", "blocked"):
+            complete_task(
+                conn, target,
+                result=(
+                    f"{verdict} via structured verdict from {source_task_id} "
+                    f"(rework P2 propagation)"
+                ),
+            )
+        elif verdict == "NEEDS_WORK" and status in ("review", "blocked", "running"):
+            bounces = int(trow["needs_work_count"] or 0) + 1
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET needs_work_count = ? WHERE id = ?",
+                    (bounces, target),
+                )
+            if bounces >= NEEDS_WORK_ESCALATION_LIMIT:
+                # block_task only transitions running/ready — release a
+                # review-status card to ready first so escalation lands.
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready' WHERE id = ? "
+                        "AND status = 'review'",
+                        (target,),
+                    )
+                block_task(
+                    conn, target,
+                    reason=(
+                        f"needs-input: {bounces} NEEDS_WORK bounces — "
+                        "auto-escalated to human decision (rework P3)"
+                    ),
+                    kind="needs_input",
+                )
+            else:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready', claim_lock = NULL,"
+                        " claim_expires = NULL, worker_pid = NULL WHERE id = ?"
+                        " AND status IN ('review', 'blocked')",
+                        (target,),
+                    )
+                _append_event(
+                    conn, target, "needs_work",
+                    {"bounce": bounces, "from": source_task_id},
+                )
+    except Exception as exc:  # noqa: BLE001 — reconciler backstop covers
+        _log.warning("verdict propagation failed for %s -> %s: %s",
+                     source_task_id, target, exc)
+
+
+def board_review_lane_enabled(board: Optional[str] = None) -> bool:
+    """P3 per-board flag: review-required blocks route to status='review'."""
+    try:
+        meta = read_board_metadata(board)
+    except Exception:
+        return False
+    return bool(isinstance(meta, dict) and meta.get("review_lane"))
+
+
+def route_review_required(
+    conn: sqlite3.Connection, task_id: str, reason: Optional[str]
+) -> bool:
+    """Route a finished-work review request to status='review' (P3).
+
+    Returns True when the board's review lane took the card (worker's claim
+    released, workspace archived-at-transition so the reviewer verifies
+    archived bytes). False = caller falls back to the legacy blocked path.
+    """
+    board = _board_slug_from_connection(conn) or get_current_board()
+    if not board_review_lane_enabled(board):
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', result = ?, claim_lock = NULL,"
+            " claim_expires = NULL, worker_pid = NULL,"
+            " wake_deadline = ? WHERE id = ? AND status IN ('running', 'ready')",
+            (reason, int(time.time()) + _REVIEW_WAKE_SECONDS, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id, outcome="completed", status="done", summary=reason
+        )
+        _append_event(
+            conn, task_id, "review_requested", {"reason": reason}, run_id=run_id
+        )
+    # Archive-at-transition (B-graft): reviewer verifies archived bytes.
+    try:
+        from hermes_cli import mission_artifacts as _ma
+
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row and row["workspace_path"] and _ma.archive_enabled():
+            _ma.archive_workspace(
+                board or "unknown-board", task_id, row["workspace_path"],
+                home=kanban_home(),
+            )
+    except Exception:  # noqa: BLE001 — archive failure surfaces at APPROVE time
+        pass
+    _fire_kanban_lifecycle_hook(
+        "kanban_review_requested", task_id, board=board, reason=reason
+    )
+    return True
+
+
+#: Re-alert cadence for an overdue card (seconds) — one stall_overdue event
+#: per window, so the pane/sentinel see fresh signal without event spam.
+_STALL_REALERT_SECONDS = 7200
+
+
+def _scan_wake_deadlines(conn: sqlite3.Connection) -> int:
+    """P1 invariant, evaluated inside the dispatch tick: overdue = event.
+
+    Every blocked/review card whose ``wake_deadline`` has passed gets a
+    ``stall_overdue`` event (deduped to one per :data:`_STALL_REALERT_SECONDS`).
+    mission-health, the sentinel, and the reconciler all read these — the
+    human stops being the stall detector. Returns the number of alerts
+    emitted this pass.
+    """
+    now = int(time.time())
+    try:
+        rows = conn.execute(
+            "SELECT id, status, wake_deadline FROM tasks "
+            "WHERE status IN ('blocked', 'review') AND wake_deadline IS NOT NULL "
+            "AND wake_deadline < ?",
+            (now,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    emitted = 0
+    for row in rows:
+        try:
+            recent = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'stall_overdue' "
+                "AND created_at > ? LIMIT 1",
+                (row["id"], now - _STALL_REALERT_SECONDS),
+            ).fetchone()
+            if recent:
+                continue
+            with write_txn(conn):
+                _append_event(
+                    conn, row["id"], "stall_overdue",
+                    {
+                        "status": row["status"],
+                        "overdue_seconds": now - int(row["wake_deadline"]),
+                    },
+                )
+            emitted += 1
+        except Exception:  # noqa: BLE001 — per-card isolation
+            continue
+    return emitted
+
+
+def install_policy_stamp_triggers(
+    conn: sqlite3.Connection, *, enforce: bool = False
+) -> str:
+    """P6 depth-3 courts: SQLite trigger backstop on the tasks table.
+
+    Closes the direct-SQL bypass CLASS (decompose/specify/dispatcher wrote
+    around the app-layer preflight): legitimate writers refresh a row in
+    ``policy_stamp`` (done automatically by :func:`connect`), and a BEFORE
+    INSERT trigger on ``tasks`` checks for a fresh stamp.
+
+    Shadow mode (default): violations are LOGGED to ``policy_violations`` —
+    nothing is blocked. Enforce mode (D8: after a clean shadow week):
+    RAISE(ABORT). ``HERMES_POLICY_MAINT_TOKEN`` set in the environment of a
+    legitimate maintenance session stamps with authority='maintenance' —
+    logged, never silent. Rollback: ``DROP TRIGGER trg_policy_stamp_insert``.
+
+    Known limitation (documented for the census): the stamp is process-scoped
+    freshness (60s window, pid-tagged), not per-connection identity — SQLite
+    triggers cannot see another connection's temp state. Shadow data is
+    directional; enforce mode still hard-stops the pure out-of-band writer
+    class (sqlite3 CLI scripts with no stamp path at all).
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS policy_stamp ("
+        " pid INTEGER, ts INTEGER NOT NULL, authority TEXT)"
+    )
+    conn.execute("DROP TRIGGER IF EXISTS trg_policy_stamp_insert")
+    if enforce:
+        action = (
+            "SELECT RAISE(ABORT, 'policy_stamp missing: direct-SQL task write "
+            "without a policied connection (rework P6 courts)')"
+        )
+    else:
+        action = (
+            "INSERT INTO policy_violations (ts, table_name, op, task_id, detail) "
+            "VALUES (strftime('%s','now'), 'tasks', 'INSERT', NEW.id, "
+            "'shadow: no fresh policy_stamp at write time')"
+        )
+    conn.execute(
+        f"""
+        CREATE TRIGGER trg_policy_stamp_insert BEFORE INSERT ON tasks
+        WHEN NOT EXISTS (
+            SELECT 1 FROM policy_stamp WHERE ts > strftime('%s','now') - 60
+        )
+        BEGIN
+            {action};
+        END
+        """
+    )
+    conn.commit()
+    return "enforce" if enforce else "shadow"
+
+
+def refresh_policy_stamp(conn: sqlite3.Connection) -> None:
+    """Refresh this process's policy stamp (called from :func:`connect`).
+
+    No-op unless the policy trigger is installed on this board — ordinary
+    boards pay zero write overhead.
+    """
+    try:
+        has_trigger = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_policy_stamp_insert' LIMIT 1"
+        ).fetchone()
+        if not has_trigger:
+            return
+        authority = (
+            "maintenance"
+            if os.environ.get("HERMES_POLICY_MAINT_TOKEN")
+            else "app"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS policy_stamp ("
+            " pid INTEGER, ts INTEGER NOT NULL, authority TEXT)"
+        )
+        conn.execute("DELETE FROM policy_stamp WHERE ts < strftime('%s','now') - 300")
+        conn.execute(
+            "INSERT INTO policy_stamp (pid, ts, authority) VALUES (?, strftime('%s','now'), ?)",
+            (os.getpid(), authority),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 — stamping must never break connect
+        pass
 
 
 def promote_task(
@@ -7204,6 +7942,19 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    # Rework P1: the tick is a component like any other — it beats into the
+    # heartbeat ledger, and it evaluates the wake_deadline invariant inline
+    # (stall detection that cannot die as a separate process).
+    try:
+        from hermes_cli import engine_health as _eh
+
+        _eh.beat("dispatcher-tick", 120, detail=f"board={board or 'default'}")
+    except Exception:  # noqa: BLE001 — liveness must never break dispatch
+        pass
+    try:
+        _scan_wake_deadlines(conn)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         db_path = kanban_db_path(board=board)
     except Exception:

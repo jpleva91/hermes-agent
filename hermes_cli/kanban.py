@@ -533,6 +533,40 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_verdict = sub.add_parser(
+        "verdict",
+        help="Record a structured review verdict (rework P2 — replaces prose "
+             "verdicts scraped by regex)",
+    )
+    p_verdict.add_argument("task_id", help="Card carrying the review step")
+    p_verdict.add_argument("--verdict", required=True,
+                           choices=["APPROVE", "NEEDS_WORK", "REJECT", "WAIVED"],
+                           help="Structured verdict (WAIVED requires --waive-authority)")
+    p_verdict.add_argument("--target", default=None,
+                           help="Reviewed task id (defaults to task_id)")
+    p_verdict.add_argument("--tier", default=None, help="Mission tier (T0-T3)")
+    p_verdict.add_argument("--evidence", action="append", default=None,
+                           metavar="PATH[:SHA256]",
+                           help="Evidence entry: archive-relative path or absolute "
+                                "path, with optional :sha256 (computed when omitted "
+                                "for existing absolute paths). Repeatable.")
+    p_verdict.add_argument("--waive-authority", default=None,
+                           help="Jared packet ref authorizing a WAIVED verdict")
+    p_verdict.add_argument("--reviewer-model", default=None,
+                           help="Reviewer model label (informational; cross_model "
+                                "is computed from run lanes, never from this)")
+    p_verdict.add_argument("--no-propagate", action="store_true",
+                           help="Record only; skip applying the verdict to the target")
+
+    p_ptrig = sub.add_parser(
+        "policy-triggers",
+        help="Install/inspect the P6 policy_stamp trigger backstop on this board",
+    )
+    p_ptrig.add_argument("mode", choices=["shadow", "enforce", "status", "remove"],
+                         help="shadow: log-only trigger; enforce: RAISE(ABORT) "
+                              "(D8: only after a clean shadow week); status: show "
+                              "violations; remove: DROP TRIGGER (instant rollback)")
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -952,6 +986,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
+            "verdict":  _cmd_verdict,
+            "policy-triggers": _cmd_policy_triggers,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1923,6 +1959,90 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_verdict(args: argparse.Namespace) -> int:
+    """Record a structured verdict row (rework P2)."""
+    manifest = []
+    for raw in args.evidence or []:
+        raw = str(raw).strip()
+        if not raw:
+            continue
+        path, _, digest = raw.rpartition(":")
+        if path and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest.lower()):
+            manifest.append({"path": path, "sha256": digest.lower()})
+            continue
+        # No explicit hash: compute for existing absolute paths.
+        import hashlib as _hl
+        from pathlib import Path as _P
+
+        p = _P(raw)
+        if p.is_absolute() and p.is_file():
+            manifest.append(
+                {"path": raw, "sha256": _hl.sha256(p.read_bytes()).hexdigest()}
+            )
+        else:
+            print(
+                f"kanban: --evidence {raw!r}: not an existing absolute file and "
+                "no :sha256 suffix given",
+                file=sys.stderr,
+            )
+            return 2
+    try:
+        with kb.connect_closing() as conn:
+            verdict_id = kb.record_verdict(
+                conn,
+                task_id=args.task_id,
+                verdict=args.verdict,
+                target_task_id=args.target,
+                tier=args.tier,
+                evidence_manifest=manifest,
+                waive_authority=getattr(args, "waive_authority", None),
+                reviewer_model=getattr(args, "reviewer_model", None),
+                propagate=not args.no_propagate,
+            )
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"Verdict {args.verdict} recorded (id={verdict_id}, "
+        f"target={args.target or args.task_id}, evidence={len(manifest)})"
+    )
+    return 0
+
+
+def _cmd_policy_triggers(args: argparse.Namespace) -> int:
+    """Install/inspect/remove the P6 policy_stamp trigger backstop."""
+    with kb.connect_closing() as conn:
+        if args.mode == "remove":
+            conn.execute("DROP TRIGGER IF EXISTS trg_policy_stamp_insert")
+            conn.commit()
+            print("policy-triggers: removed")
+            return 0
+        if args.mode == "status":
+            try:
+                installed = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                    "AND name='trg_policy_stamp_insert'"
+                ).fetchone()
+                rows = conn.execute(
+                    "SELECT ts, op, task_id, detail FROM policy_violations "
+                    "ORDER BY ts DESC LIMIT 20"
+                ).fetchall()
+            except Exception as exc:  # noqa: BLE001
+                print(f"policy-triggers: status unavailable: {exc}", file=sys.stderr)
+                return 1
+            print(f"trigger installed: {'yes' if installed else 'no'}")
+            print(f"violations (latest {len(rows)}):")
+            for r in rows:
+                print(f"  {r['ts']}  {r['op']}  {r['task_id'] or '-'}  {r['detail']}")
+            return 0
+        mode = kb.install_policy_stamp_triggers(conn, enforce=args.mode == "enforce")
+        print(
+            f"policy-triggers: installed in {mode} mode "
+            f"({'RAISE(ABORT)' if mode == 'enforce' else 'log-only to policy_violations'})"
+        )
+        return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:

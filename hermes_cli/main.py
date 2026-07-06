@@ -11929,6 +11929,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
+        "mission-health", "receipt",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
@@ -12681,6 +12682,52 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # mission-health — Mission Engine single pane of truth (rework P1)
+    # =========================================================================
+    def _cmd_mission_health(args):
+        from hermes_cli.mission_health import main as _mh_main
+
+        return _mh_main([])
+
+    mh_parser = subparsers.add_parser(
+        "mission-health",
+        help="Mission Engine single-pane health report (liveness, stalls, "
+             "backups, evidence survival, cost, overhead SLO)",
+    )
+    mh_parser.set_defaults(func=_cmd_mission_health)
+
+    # =========================================================================
+    # receipt — signed, verifiable receipt for agent labor (rework P6)
+    # =========================================================================
+    def _cmd_receipt(args):
+        from hermes_cli.receipt import main as _receipt_main
+
+        if getattr(args, "verify", None):
+            argv = ["--verify", args.verify]
+        elif getattr(args, "task_id", None):
+            argv = [args.task_id]
+            if getattr(args, "board", None):
+                argv += ["--board", args.board]
+            if getattr(args, "out", None):
+                argv += ["--out", args.out]
+        else:
+            receipt_parser.print_usage()
+            return 2
+        return _receipt_main(argv)
+
+    receipt_parser = subparsers.add_parser(
+        "receipt",
+        help="Export (or --verify) a signed receipt: verdict chain + sha256 "
+             "evidence manifests + model lane + cost",
+    )
+    receipt_parser.add_argument("task_id", nargs="?", help="Task id to export")
+    receipt_parser.add_argument("--board", default=None, help="Board slug")
+    receipt_parser.add_argument("--out", default=None, help="Output path")
+    receipt_parser.add_argument("--verify", default=None, metavar="RECEIPT_JSON",
+                                help="Verify an existing receipt file (exit 0/1)")
+    receipt_parser.set_defaults(func=_cmd_receipt)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
