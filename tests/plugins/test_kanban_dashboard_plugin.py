@@ -43,12 +43,20 @@ def _load_plugin_router():
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Isolated HERMES_HOME with an empty kanban DB and the mission policy."""
+    from hermes_cli import mission_guardrail_policy as mgp
+    from tests.mission_policy_fixtures import write_mission_policy
+
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    # Externalized Spec 002 mission guardrail policy (formerly hardcoded in
+    # kanban_db.py). The mission-board dashboard preflight enforces via this
+    # file; its board.slug identifies the governed board.
+    mgp.clear_cache()
+    write_mission_policy(home)
     return home
 
 

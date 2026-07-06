@@ -136,44 +136,45 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
-# Spec 002 Mission Engine guardrail (D2-016/D2-017).  This is deliberately
-# scoped to the mission-ledger board so ordinary Kanban boards can keep using
-# arbitrary project-specific assignees.  The active cast comes from
-# ~/.hermes/specs/002-mission-engine/spec.md, but is duplicated here as a small
-# runtime preflight so stale on-disk profiles such as ``systemsarchitect`` do not
-# receive new mission cards just because ``hermes profile list`` can see them.
-MISSION_ENGINE_BOARD_SLUG = "fable-emulation-workflow"
-MISSION_ENGINE_COMMANDER = "missioncommander"
-MISSION_ENGINE_ACTIVE_CAST = frozenset({
-    "missioncommander",
-    "specsteward",
-    "sourcecartographer",
-    "claudecodeconductor",
-    "codexoperator",
-    "gatewarden",
-    "runtimesteward",
-})
-_MISSION_ENGINE_MISSION_SHAPED_RE = re.compile(
-    r"\b("
-    r"t[12]|mission|multi[- ]?step|implement|implementation|architecture|"
-    r"product behavior|user[- ]visible|source packet|rehearsal|review|gate|"
-    r"evidence|delegate_task|background agent|deploy|release|closeout"
-    r")\b",
-    re.IGNORECASE,
-)
+# Spec 002 Mission Engine guardrail (D2-016/D2-017).  The concrete guardrail
+# data — which board is the mission board, the active role cast, the Mission
+# Commander role, and the mission-shape regex — is NOT hardcoded here.  It
+# lives in a versioned YAML policy under
+# ``~/.hermes/specs/002-mission-engine/mission-guardrail-policy.yaml`` (loaded
+# by :mod:`hermes_cli.mission_guardrail_policy`).  This module keeps only a
+# thin, board-agnostic hook: if the authoritative board is declared (or named
+# by) a mission guardrail policy, enforce it; otherwise fail open so ordinary
+# Kanban boards keep using arbitrary project-specific assignees.  The board
+# metadata declaration is what lets a declared-but-mispolicied mission board
+# fail closed without pinning the mission board slug into this file.
 
 
-def _mission_engine_board_active(board: Optional[str] = None) -> bool:
+def _resolve_mission_guardrail_policy(board: Optional[str]):
+    """Return the mission guardrail policy governing ``board``, or ``None``.
+
+    Fails open (returns ``None``) for ordinary/undeclared boards with no
+    matching policy.  Fails closed (raises ``ValueError`` via
+    :class:`~hermes_cli.mission_guardrail_policy.MissionGuardrailPolicyError`)
+    when a board is *declared* a mission board but its policy is missing,
+    corrupt, invalid, or names a different board.
+    """
+    from hermes_cli import mission_guardrail_policy as _mgp
+
     try:
-        resolved = _normalize_board_slug(board) if board else get_current_board()
+        slug = _normalize_board_slug(board) if board else get_current_board()
     except Exception:
-        return False
-    return resolved == MISSION_ENGINE_BOARD_SLUG
-
-
-def _mission_engine_is_mission_shaped(title: str, body: Optional[str]) -> bool:
-    haystack = f"{title or ''}\n{body or ''}"
-    return bool(_MISSION_ENGINE_MISSION_SHAPED_RE.search(haystack))
+        return None
+    if not slug:
+        return None
+    try:
+        meta = read_board_metadata(slug)
+    except Exception:
+        meta = {}
+    home = kanban_home()
+    default_path = home.joinpath(*_mgp.DEFAULT_POLICY_RELPATH)
+    return _mgp.resolve_policy_for_board(
+        slug, meta, default_path=default_path, home=home
+    )
 
 
 def _board_slug_from_connection(conn: sqlite3.Connection) -> Optional[str]:
@@ -280,35 +281,24 @@ def _validate_mission_engine_card_preflight(
 ) -> None:
     """Enforce the narrow Spec 002 mission-card minting invariants.
 
-    Guardrails:
-    - Active-cast only for new/reassigned cards on the Mission Engine board.
-    - Goal-mode/non-commander chat intake must hand mission-shaped T1/T2 work to
-      Mission Commander instead of directly spawning an implementation lane.
+    The invariants themselves — active-cast-only, and Mission Commander handoff
+    for mission-shaped goal-mode / non-commander chat intake — are described by
+    the externalized mission guardrail policy.  This hook only decides whether a
+    policy applies to the authoritative board and delegates enforcement to it;
+    ordinary boards (no policy / no declaration) fail open here.
     """
 
-    if not _mission_engine_board_active(board):
+    policy = _resolve_mission_guardrail_policy(board)
+    if policy is None:
         return
-    if assignee and assignee not in MISSION_ENGINE_ACTIVE_CAST:
-        raise ValueError(
-            "Spec 002 active-cast preflight rejected assignee "
-            f"{assignee!r}: active mission cards may target only "
-            f"{', '.join(sorted(MISSION_ENGINE_ACTIVE_CAST))}; retired or "
-            "non-canonical profiles (for example systemsarchitect) must not "
-            "receive new Mission Engine cards"
-        )
-    if assignee == MISSION_ENGINE_COMMANDER:
-        return
-    if not _mission_engine_is_mission_shaped(title, body):
-        return
-    creator = (created_by or "").strip()
-    parent_list = tuple(p for p in parents if p)
-    if goal_mode or (creator and creator != MISSION_ENGINE_COMMANDER and not parent_list):
-        raise ValueError(
-            "Spec 002 goal-mode handoff preflight rejected mission-shaped "
-            "work outside Mission Commander: T1/T2 goal-mode/chat intake "
-            "must create/request a Mission Commander handoff card and stop "
-            "before implementation"
-        )
+    policy.check_card(
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        goal_mode=goal_mode,
+        parents=parents,
+    )
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:

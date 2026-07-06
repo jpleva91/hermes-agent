@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -15,16 +16,59 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import mission_guardrail_policy as mgp
+from tests.mission_policy_fixtures import MISSION_BOARD_SLUG, write_mission_policy
+
+
+# ---------------------------------------------------------------------------
+# Spec 002 mission guardrail policy fixtures
+#
+# The mission board slug, active cast, Mission Commander role, and mission-shape
+# regex used to be hardcoded in ``kanban_db.py``.  They now live in an
+# externalized YAML policy (see ``tests.mission_policy_fixtures``). These tests
+# write that policy into an isolated HERMES_HOME so the mission-board tests below
+# enforce via the file — proving the guardrail is policy-driven, not baked in.
+# ---------------------------------------------------------------------------
+
+
+def declare_mission_board(slug, *, policy_path=None, mission_board=True):
+    """Add mission-board declaration fields to an existing board's ``board.json``."""
+    meta_path = kb.board_metadata_path(slug)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            meta = {}
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    if mission_board:
+        meta["mission_board"] = True
+    if policy_path is not None:
+        meta["mission_guardrail_policy"] = str(policy_path)
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    return meta_path
+
+
+@pytest.fixture(autouse=True)
+def _reset_mission_policy_cache():
+    """Keep the parsed-policy cache from leaking across tests in-process."""
+    mgp.clear_cache()
+    yield
+    mgp.clear_cache()
 
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Isolated HERMES_HOME with an empty kanban DB and the mission policy."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    # Externalized Spec 002 mission guardrail policy (formerly hardcoded in
+    # kanban_db.py). Its board.slug identifies the mission board, so the mission
+    # tests below fire off this file rather than any in-code constant.
+    write_mission_policy(home)
     return home
 
 
@@ -343,6 +387,12 @@ def test_kanban_cli_entrypoint_preflight_honors_pinned_db_when_home_differs(
             "HERMES_KANBAN_BOARD": board,
             "HERMES_KANBAN_DB": str(board_db),
             "PYTHONPATH": str(repo_root),
+            # The child HERMES_HOME cannot see the parent's default policy path,
+            # so pin the policy explicitly. It still only applies because its
+            # board.slug matches the board inferred from the pinned DB.
+            "HERMES_MISSION_GUARDRAIL_POLICY": str(
+                kanban_home / "specs" / "002-mission-engine" / "mission-guardrail-policy.yaml"
+            ),
         }
     )
 
@@ -410,6 +460,12 @@ def test_kanban_cli_entrypoint_preflight_prefers_pinned_db_over_stale_current_bo
             "HERMES_HOME": str(child_home),
             "HERMES_KANBAN_DB": str(board_db),
             "PYTHONPATH": str(repo_root),
+            # Policy applies only because its board.slug matches the board the
+            # pinned DB really targets — not the stale ``side-project`` current
+            # board the child HERMES_HOME would otherwise select.
+            "HERMES_MISSION_GUARDRAIL_POLICY": str(
+                kanban_home / "specs" / "002-mission-engine" / "mission-guardrail-policy.yaml"
+            ),
         }
     )
 
@@ -437,6 +493,110 @@ def test_kanban_cli_entrypoint_preflight_prefers_pinned_db_over_stale_current_bo
             task = kb.get_task(conn, tid)
         assert task is not None
         assert task.assignee == "runtimesteward"
+
+
+def test_undeclared_board_without_policy_fails_open(kanban_home):
+    """No policy file + no board declaration => ungoverned, even for the mission
+    board slug. Proves the guardrail carries no hardcoded in-code fallback."""
+    (kanban_home / "specs" / "002-mission-engine" / "mission-guardrail-policy.yaml").unlink()
+    with kb.connect(board=MISSION_BOARD_SLUG) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Implement T2 mission architecture directly",
+            assignee="systemsarchitect",
+            created_by="runtimesteward",
+            goal_mode=True,
+            board=MISSION_BOARD_SLUG,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "systemsarchitect"
+
+
+def test_mission_board_fails_closed_when_declared_policy_missing(kanban_home):
+    """A board declared a mission board whose policy path is missing must refuse
+    to mutate (fail-closed) rather than silently fail open."""
+    slug = "declared-mission-missing"
+    kb.create_board(slug)
+    missing = kanban_home / "specs" / "002-mission-engine" / "does-not-exist.yaml"
+    declare_mission_board(slug, policy_path=missing)
+    with kb.connect(board=slug) as conn:
+        with pytest.raises(ValueError, match="fail-closed"):
+            kb.create_task(
+                conn,
+                title="anything at all",
+                assignee="missioncommander",
+                created_by="missioncommander",
+                board=slug,
+            )
+
+
+def test_mission_board_fails_closed_when_declared_policy_corrupt(kanban_home):
+    """A declared mission board with corrupt policy YAML must fail closed."""
+    slug = "declared-mission-corrupt"
+    kb.create_board(slug)
+    policy_path = kanban_home / "specs" / "002-mission-engine" / "corrupt.yaml"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text(
+        "kind: mission_engine_guardrail_policy\nboard: {slug: x\n", encoding="utf-8"
+    )
+    declare_mission_board(slug, policy_path=policy_path)
+    with kb.connect(board=slug) as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(
+                conn,
+                title="anything at all",
+                assignee="missioncommander",
+                created_by="missioncommander",
+                board=slug,
+            )
+
+
+def test_mission_guardrail_is_policy_driven_not_hardcoded(kanban_home):
+    """The board slug, active cast, commander, and mission-shape regex are all
+    controlled by the policy file — none survive as in-code constants."""
+    slug = "custom-mission-board"
+    kb.create_board(slug)
+    policy_path = kanban_home / "specs" / "custom" / "policy.yaml"
+    write_mission_policy(
+        kanban_home,
+        relpath=("specs", "custom", "policy.yaml"),
+        slug=slug,
+        roles=["alpha", "beta"],
+        commander="alpha",
+        pattern=r"\bdragonfruit\b",
+    )
+    declare_mission_board(slug, policy_path=policy_path)
+    with kb.connect(board=slug) as conn:
+        # A canonical cast member is NOT in this policy's cast -> rejected.
+        with pytest.raises(ValueError, match="active-cast preflight"):
+            kb.create_task(
+                conn, title="ordinary", assignee="runtimesteward", created_by="alpha", board=slug
+            )
+        # A member of THIS policy's cast is accepted.
+        tid = kb.create_task(conn, title="ordinary", assignee="beta", created_by="alpha", board=slug)
+        assert kb.get_task(conn, tid).assignee == "beta"
+        # Canonical mission words do NOT match this policy's regex -> allowed
+        # even in goal-mode from a non-commander.
+        ok = kb.create_task(
+            conn,
+            title="Implement T2 mission architecture",
+            assignee="beta",
+            created_by="beta",
+            goal_mode=True,
+            board=slug,
+        )
+        assert kb.get_task(conn, ok).assignee == "beta"
+        # The policy's unique mission token DOES trip the commander-handoff guard.
+        with pytest.raises(ValueError, match="goal-mode handoff preflight"):
+            kb.create_task(
+                conn,
+                title="dragonfruit special",
+                assignee="beta",
+                created_by="beta",
+                goal_mode=True,
+                board=slug,
+            )
 
 
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
