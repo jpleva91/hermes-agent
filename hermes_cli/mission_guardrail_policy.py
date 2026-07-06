@@ -92,6 +92,14 @@ class MissionGuardrailPolicyError(ValueError):
 
 
 @dataclass(frozen=True)
+class ArtifactRequirement:
+    """One required artifact pointer pattern for mission handoff cards."""
+
+    name: str
+    pattern: re.Pattern
+
+
+@dataclass(frozen=True)
 class MissionGuardrailPolicy:
     """Immutable, validated view of a mission guardrail policy."""
 
@@ -101,6 +109,8 @@ class MissionGuardrailPolicy:
     mission_shape: Optional[re.Pattern]
     active_cast_diagnostic: str
     goal_mode_diagnostic: str
+    artifact_requirements: tuple[ArtifactRequirement, ...]
+    artifact_contract_diagnostic: str
     source_path: Path
 
     def _matches_mission_shape(self, title: Optional[str], body: Optional[str]) -> bool:
@@ -145,6 +155,19 @@ class MissionGuardrailPolicy:
         parent_list = tuple(p for p in parents if p)
         if goal_mode or (creator and creator != self.commander_role and not parent_list):
             raise ValueError(self.goal_mode_diagnostic)
+        if (
+            self.artifact_requirements
+            and creator == self.commander_role
+            and assignee
+            and assignee != self.commander_role
+        ):
+            haystack = f"{title or ''}\n{body or ''}"
+            missing = [req.name for req in self.artifact_requirements if not req.pattern.search(haystack)]
+            if missing:
+                raise ValueError(
+                    f"{self.artifact_contract_diagnostic} "
+                    f"(missing artifact pointer(s): {', '.join(missing)})"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +244,58 @@ def _diagnostics(data: Mapping[str, Any]) -> tuple[str, str]:
     return active_diag, goal_diag
 
 
+def _artifact_contract(data: Mapping[str, Any], path: Path) -> tuple[tuple[ArtifactRequirement, ...], str]:
+    """Parse optional artifact-driven handoff requirements.
+
+    When enabled, every Mission-Commander-created worker child card must cite
+    durable artifacts (for example a Spec Kit packet and a source/NotebookLM
+    packet) before the engine will mint it. This closes the gap where an
+    executor lane can produce code and a handoff while bypassing the governing
+    artifact spine.
+    """
+    default_diag = (
+        "Spec 002 artifact-driven handoff preflight rejected mission-shaped "
+        "worker card: executor lanes require durable Spec Kit/source artifacts "
+        "before implementation"
+    )
+    rules = data.get("preflight_rules")
+    cfg = rules.get("artifact_driven_handoff") if isinstance(rules, dict) else None
+    if cfg is None:
+        return (), default_diag
+    _require(isinstance(cfg, dict), path, "preflight_rules.artifact_driven_handoff must be a mapping")
+    enabled = cfg.get("enabled", True)
+    if enabled is False:
+        return (), str(cfg.get("diagnostic") or default_diag).strip() or default_diag
+    raw_patterns = cfg.get("required_patterns")
+    _require(
+        isinstance(raw_patterns, list) and len(raw_patterns) > 0,
+        path,
+        "preflight_rules.artifact_driven_handoff.required_patterns must be a non-empty list",
+    )
+    requirements: list[ArtifactRequirement] = []
+    for idx, raw in enumerate(raw_patterns):
+        _require(isinstance(raw, dict), path, "artifact required_patterns entries must be mappings")
+        name = str(raw.get("name") or f"artifact_{idx + 1}").strip()
+        pattern = raw.get("pattern")
+        _require(bool(name), path, "artifact required_patterns.name must be non-empty")
+        _require(
+            isinstance(pattern, str) and bool(pattern.strip()),
+            path,
+            f"artifact pattern {name!r} must be non-empty",
+        )
+        flags = _compile_flags(raw.get("flags") or ["IGNORECASE"], path)
+        try:
+            compiled = re.compile(pattern, flags)
+        except re.error as exc:
+            raise MissionGuardrailPolicyError(
+                f"invalid mission guardrail policy at {path}: artifact pattern "
+                f"{name!r} does not compile: {exc}"
+            ) from exc
+        requirements.append(ArtifactRequirement(name=name, pattern=compiled))
+    diagnostic = str(cfg.get("diagnostic") or default_diag).strip() or default_diag
+    return tuple(requirements), diagnostic
+
+
 def _parse_and_validate(path: Path) -> MissionGuardrailPolicy:
     try:
         raw_text = path.read_text(encoding="utf-8")
@@ -294,6 +369,7 @@ def _parse_and_validate(path: Path) -> MissionGuardrailPolicy:
     _validate_fail_safe(data.get("fail_safe"), path)
 
     active_diag, goal_diag = _diagnostics(data)
+    artifact_requirements, artifact_diag = _artifact_contract(data, path)
     return MissionGuardrailPolicy(
         board_slug=board_slug,
         commander_role=commander,
@@ -301,6 +377,8 @@ def _parse_and_validate(path: Path) -> MissionGuardrailPolicy:
         mission_shape=regex,
         active_cast_diagnostic=active_diag,
         goal_mode_diagnostic=goal_diag,
+        artifact_requirements=artifact_requirements,
+        artifact_contract_diagnostic=artifact_diag,
         source_path=path,
     )
 
