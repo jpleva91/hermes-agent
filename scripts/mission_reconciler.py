@@ -138,6 +138,12 @@ _OVERHEAD_TITLE_RE = re.compile(
 STRUCTURED_SOURCE = "task_verdicts"
 LEGACY_SOURCE = "legacy-prose"
 
+MISSION_STATE_REVIEW_REQUIRED_UNREVIEWED = "review_required_unreviewed"
+MISSION_STATE_REVIEW_GATE_OPEN = "review_gate_open"
+MISSION_STATE_REVIEW_APPROVED_PENDING_APPLY = "review_approved_pending_apply"
+MISSION_STATE_REVIEW_NEEDS_WORK_PENDING_APPLY = "review_needs_work_pending_apply"
+MISSION_STATE_DUPLICATE_GATE_SUPPRESSED = "duplicate_gate_suppressed"
+
 
 # ---------------------------------------------------------------------------
 # Small read helpers (READ-ONLY board access; mutation is kanban_db-only)
@@ -538,6 +544,11 @@ def _verdict_action(
         return {
             **base,
             "type": "apply-APPROVE",
+            "mission_state": MISSION_STATE_REVIEW_APPROVED_PENDING_APPLY,
+            "next_action": (
+                "apply_legacy_review_approval"
+                if fact["legacy_source"] else "apply_structured_review_approval"
+            ),
             "result": (
                 f"Gate verdict {verdict} applied by {ACTOR} from "
                 f"{fact['source']} origin `{fact['origin_id']}`."
@@ -551,6 +562,8 @@ def _verdict_action(
         return {
             **base,
             "type": "apply-NEEDS_WORK",
+            "mission_state": MISSION_STATE_REVIEW_NEEDS_WORK_PENDING_APPLY,
+            "next_action": "apply_needs_work_feedback",
             "feedback": feedback[:1500],
             "wiring_gap": (
                 "needs_work_count not incremented: no public kanban_db function "
@@ -631,38 +644,51 @@ def build_plan(
         lineages.add(root)
         stall_extra: Optional[str] = None
 
-        if _is_review_required_blocked(conn, row) and not (
-            _open_gate_exists(conn, row["id"]) or (root != row["id"] and _open_gate_exists(conn, root))
-        ):
-            # Review-required handoff with no reviewer anywhere: repair needs
-            # genuinely new labor (a parentless Gate Warden review card).
-            fp = defect_fingerprint(root, "review-gate", row["id"])
-            mint = {
-                "type": "mint",
-                "defect_class": "review-gate",
-                "target": row["id"],
-                "target_title": _base_title(row["title"])[:80],
-                "lineage_root": root,
-                "defect_fingerprint": fp,
-                "assignee": GATEWARDEN,
-                "title": f"Ready gate: review-required handoff for {_base_title(row['title'])[:58]}",
-                "idempotency_key": f"reconciler:review-gate:{root}",
-                "reason": "review-required blocked with no open Gate Warden card for target or lineage root",
-            }
-            if _fingerprint_seen(conn, root, fp):
-                mint["type"] = "suppressed-duplicate"
-                mint["reason"] = (
-                    "defect fingerprint already recorded — repair already attempted; "
-                    "never re-mint on suppression"
-                )
-                actions.append(mint)
-                inv["disposition"] = "suppressed-duplicate"
-                stall_extra = "repair already attempted (fingerprint suppressed) and card is still blocked"
+        if _is_review_required_blocked(conn, row):
+            open_gate_exists = _open_gate_exists(conn, row["id"]) or (
+                root != row["id"] and _open_gate_exists(conn, root)
+            )
+            if open_gate_exists:
+                inv["mission_state"] = MISSION_STATE_REVIEW_GATE_OPEN
+                inv["next_action"] = "await_gate_verdict"
             else:
-                actions.append(mint)
-                inv["disposition"] = "mint-proposed"
-                handled.add(row["id"])
-                continue
+                # Review-required handoff with no reviewer anywhere: repair needs
+                # genuinely new labor (a parentless Gate Warden review card).
+                fp = defect_fingerprint(root, "review-gate", row["id"])
+                mint = {
+                    "type": "mint",
+                    "mission_state": MISSION_STATE_REVIEW_REQUIRED_UNREVIEWED,
+                    "next_action": "create_no_write_review_gate",
+                    "defect_class": "review-gate",
+                    "target": row["id"],
+                    "target_title": _base_title(row["title"])[:80],
+                    "lineage_root": root,
+                    "defect_fingerprint": fp,
+                    "assignee": GATEWARDEN,
+                    "title": f"Ready gate: review-required handoff for {_base_title(row['title'])[:58]}",
+                    "idempotency_key": f"reconciler:review-gate:{root}",
+                    "reason": "review-required blocked with no open Gate Warden card for target or lineage root",
+                }
+                inv["mission_state"] = MISSION_STATE_REVIEW_REQUIRED_UNREVIEWED
+                inv["next_action"] = "create_no_write_review_gate"
+                if _fingerprint_seen(conn, root, fp):
+                    mint["type"] = "suppressed-duplicate"
+                    mint["mission_state"] = MISSION_STATE_DUPLICATE_GATE_SUPPRESSED
+                    mint["next_action"] = "report_stalled_duplicate_gate"
+                    mint["reason"] = (
+                        "defect fingerprint already recorded — repair already attempted; "
+                        "never re-mint on suppression"
+                    )
+                    actions.append(mint)
+                    inv["mission_state"] = MISSION_STATE_DUPLICATE_GATE_SUPPRESSED
+                    inv["next_action"] = "report_stalled_duplicate_gate"
+                    inv["disposition"] = "suppressed-duplicate"
+                    stall_extra = "repair already attempted (fingerprint suppressed) and card is still blocked"
+                else:
+                    actions.append(mint)
+                    inv["disposition"] = "mint-proposed"
+                    handled.add(row["id"])
+                    continue
 
         deadline, basis = _stall_deadline(conn, row, has_wake_deadline)
         inv["deadline"] = deadline
@@ -855,6 +881,8 @@ def apply_plan(
                 executed.append({
                     **action,
                     "type": "suppressed-duplicate",
+                    "mission_state": MISSION_STATE_DUPLICATE_GATE_SUPPRESSED,
+                    "next_action": "report_stalled_duplicate_gate",
                     "executed": False,
                     "reason": "UNIQUE(lineage_root, fingerprint) violation — repair already attempted",
                 })

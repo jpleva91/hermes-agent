@@ -139,6 +139,8 @@ def test_structured_approve_planned_and_applied(board):
     assert action["target"] == "t_aaa1"
     assert action["verdict_source"] == "task_verdicts"
     assert action["legacy_source"] is False
+    assert action["mission_state"] == "review_approved_pending_apply"
+    assert action["next_action"] == "apply_structured_review_approval"
 
     applied = recon.apply_plan(conn, plan, now=NOW)
     done = [a for a in applied["actions"] if a["type"] == "apply-APPROVE"]
@@ -157,6 +159,8 @@ def test_duplicate_mint_suppressed_by_unique(board):
     mints = [a for a in plan["actions"] if a["type"] == "mint"]
     assert len(mints) == 1
     assert mints[0]["defect_class"] == "review-gate"
+    assert mints[0]["mission_state"] == "review_required_unreviewed"
+    assert mints[0]["next_action"] == "create_no_write_review_gate"
     fp = mints[0]["defect_fingerprint"]
     assert fp == recon.defect_fingerprint("t_bbb1", "review-gate", "t_bbb1")
 
@@ -181,6 +185,9 @@ def test_duplicate_mint_suppressed_by_unique(board):
     assert "suppressed-duplicate" in types
     assert "mint" not in types
     assert "stall-report" in types
+    suppressed2 = [a for a in plan2["actions"] if a["type"] == "suppressed-duplicate"]
+    assert suppressed2[0]["mission_state"] == "duplicate_gate_suppressed"
+    assert suppressed2[0]["next_action"] == "report_stalled_duplicate_gate"
 
 
 def test_mint_executes_and_records_fingerprint(board):
@@ -205,6 +212,12 @@ def test_mint_executes_and_records_fingerprint(board):
     # Level-triggered: next pass sees the open gate and plans nothing new.
     plan2 = recon.build_plan(conn, now=NOW)
     assert not [a for a in plan2["actions"] if a["type"] in ("mint", "suppressed-duplicate")]
+    blocked = [
+        b for b in plan2["health"]["blocked_inventory"]
+        if b["target"] == "t_ccc1"
+    ]
+    assert blocked[0]["mission_state"] == "review_gate_open"
+    assert blocked[0]["next_action"] == "await_gate_verdict"
 
 
 def test_circuit_breaker_aborts_minting(board):
@@ -304,6 +317,8 @@ def test_structured_needs_work_recycles_card(board):
     plan = recon.build_plan(conn, now=NOW)
     nw = [a for a in plan["actions"] if a["type"] == "apply-NEEDS_WORK"]
     assert len(nw) == 1 and nw[0]["target"] == "t_aab2"
+    assert nw[0]["mission_state"] == "review_needs_work_pending_apply"
+    assert nw[0]["next_action"] == "apply_needs_work_feedback"
 
     before = task_count(conn)
     applied = recon.apply_plan(conn, plan, now=NOW)
