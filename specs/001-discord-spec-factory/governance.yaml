@@ -1,0 +1,86 @@
+schema_version: 1
+name: hermes-discord-spec-factory
+status: draft
+canonical_state: spec_kit
+
+scope:
+  source_of_truth: "Spec Kit workflow artifacts and state under the repository"
+  discord: "intake, clarification, review, approval, and notification surface"
+  kanban: "optional derived projection only"
+  github: "handoff target after approval"
+
+activation:
+  default_enabled: false
+  placeholder_channel_id: DISCORD_SPEC_FACTORY_INTAKE_CHANNEL_ID
+  fail_closed_conditions:
+    - enabled flag missing or false
+    - channel id empty, wildcard, or placeholder
+    - no allowed users or roles for live activation
+    - repository/workspace missing for phases that need repository context
+    - required role route missing for the current phase
+    - approval actor unauthorized
+    - Discord workflow thread unavailable for a human gate
+
+permissions:
+  intake:
+    required: authorized Discord user or role in configured channel
+    side_effects: local Spec Kit state only
+  clarify:
+    required: workflow participant or maintainer role
+    side_effects: append answers to workflow state
+  plan_review:
+    required: maintainer approval
+    side_effects: advance planning gate
+  execution:
+    required: complete role route and workspace boundary
+    side_effects: local files/git only unless separately approved
+  github_handoff:
+    required: release-captain approval and configured credentials
+    side_effects: remote GitHub issue/PR/comment operations
+
+routing_roles:
+  required:
+    - intake-triage
+    - spec-lead
+    - architect
+    - implementer
+    - reviewer
+    - release-captain
+    - operator-notifier
+  route_fields:
+    - profile
+    - model
+    - toolsets
+    - workspace
+    - side_effects
+    - approval_required
+
+state_invariants:
+  - "Every accepted Discord message maps to exactly one workflow_id unless explicitly forked."
+  - "Every workflow_id maps to one canonical Spec Kit feature directory."
+  - "Every workflow has at most one active Discord workflow thread."
+  - "Kanban cards, if present, link back to workflow_id and feature directory and are recoverable projections."
+  - "GitHub handoff links back to source packet, Spec Kit directory, and approval evidence."
+
+migration:
+  enablement_steps:
+    - add disabled config with placeholder channel id
+    - run local synthetic tests
+    - replace placeholder with real Discord channel id
+    - add allowed role/user ids
+    - configure role routes to existing Hermes profiles
+    - enable intake after dry-run validation
+  rollback_steps:
+    - set factory enabled false
+    - leave existing Spec Kit workflow directories intact
+    - disable Kanban projection if configured
+    - archive or lock Discord workflow threads manually if desired
+    - do not delete source/context packets unless following retention policy
+
+acceptance_gates:
+  - config validation tests pass
+  - source packet tests pass
+  - role route tests pass
+  - thread contract tests pass with synthetic adapter
+  - Kanban projection disabled-mode tests pass
+  - PR target contract tests pass without remote git

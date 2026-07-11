@@ -1,0 +1,38 @@
+# Contract: Dedicated Workflow Thread
+
+schema_version: 1
+kind: discord_spec_factory_workflow_thread
+
+thread_naming:
+  format: "spec-{short_workflow_id}: {short_title}"
+  max_length: 90
+  collision_behavior: append short source message id
+
+required_fields:
+  - workflow_id
+  - parent_channel_id
+  - thread_id
+  - source_message_id
+  - feature_directory
+
+semantics:
+  - one active Discord workflow thread per workflow_id
+  - thread replies are eligible as clarify/review/approval input only when the workflow_id mapping exists
+  - parent channel prompt and skill bindings may be inherited, but workflow-specific state comes from Spec Kit
+  - thread creation failure blocks human gates and emits a recoverable notification
+  - deleting/archiving the thread never deletes canonical Spec Kit state
+
+messages:
+  initial_thread_brief:
+    must_include:
+      - workflow id
+      - source message link or id
+      - feature directory
+      - current phase
+      - required next action
+  gate_prompt:
+    must_include:
+      - gate id
+      - actor/role authorized to answer
+      - allowed options or requested clarification
+      - timeout/expiration if configured

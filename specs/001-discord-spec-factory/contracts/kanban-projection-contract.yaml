@@ -1,0 +1,27 @@
+# Contract: Optional Kanban Projection
+
+schema_version: 1
+kind: discord_spec_factory_kanban_projection
+
+modes:
+  disabled:
+    description: No Kanban cards are created or updated.
+  notify-only:
+    description: Notifications/comments may be emitted, but no worker card graph is authoritative.
+  mirror-cards:
+    description: Cards mirror Spec Kit phases/tasks and link back to workflow state.
+
+rules:
+  - Spec Kit workflow state is canonical in every mode
+  - projection failure must not advance, rewind, or delete workflow state
+  - every projected card must include workflow_id and feature_directory link
+  - card completion may be observed as evidence but cannot by itself satisfy approval gates
+  - projection can be rebuilt from Spec Kit state and event log
+
+card_shape:
+  title: "[{workflow_id}] {phase}: {summary}"
+  body_must_include:
+    - canonical feature directory
+    - Discord workflow thread id/link
+    - source packet path
+    - current phase and projection timestamp

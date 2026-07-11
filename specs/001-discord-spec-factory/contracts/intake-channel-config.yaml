@@ -1,0 +1,33 @@
+# Contract: Discord Intake Channel Configuration
+
+schema_version: 1
+kind: discord_spec_factory_intake_binding
+
+example:
+  enabled: false
+  channel_id: DISCORD_SPEC_FACTORY_INTAKE_CHANNEL_ID
+  allowed_role_ids:
+    - DISCORD_MAINTAINER_ROLE_ID
+  allowed_user_ids: []
+  repository:
+    path: /absolute/path/to/repo
+    default_branch: main
+  channel_prompt: |
+    You are Hermes intake for Spec Kit workflows. Convert requests into source packets and ask clarifying questions in workflow threads.
+  channel_skill_bindings:
+    - hermes-agent
+    - speckit-specify
+    - speckit-plan
+    - speckit-tasks
+  kanban_projection:
+    enabled: false
+    mode: notify-only
+  failure_channel_id: null
+
+rules:
+  - enabled must be explicit true before live intake activates
+  - channel_id must be a concrete Discord channel/forum ID, not empty, wildcard, or placeholder
+  - live activation requires at least one allowed role or user
+  - channel_prompt and channel_skill_bindings should be projected through existing Discord channel_prompts/channel_skill_bindings config
+  - repository is required before plan/execution/handoff phases
+  - kanban_projection is optional and derived

@@ -1,0 +1,81 @@
+# Contract: Role/Profile/Model Routing
+
+schema_version: 1
+kind: discord_spec_factory_role_routes
+
+required_roles:
+  - intake-triage
+  - spec-lead
+  - architect
+  - implementer
+  - reviewer
+  - release-captain
+  - operator-notifier
+
+route_shape:
+  role:
+    profile: existing Hermes profile name
+    model: provider/model string or configured tier alias
+    toolsets: list of Hermes toolsets allowed for the role
+    workspace: scratch | worktree | dir:/absolute/path
+    side_effects: none | local-files | local-git | remote-github
+    approval_required: boolean
+    max_turns: optional integer
+    budget_usd: optional number
+
+example:
+  intake-triage:
+    profile: default
+    model: fast
+    toolsets: [file]
+    workspace: scratch
+    side_effects: local-files
+    approval_required: false
+  spec-lead:
+    profile: spec-lead
+    model: reasoning
+    toolsets: [file, terminal]
+    workspace: worktree
+    side_effects: local-files
+    approval_required: true
+  architect:
+    profile: architect
+    model: reasoning
+    toolsets: [file]
+    workspace: worktree
+    side_effects: local-files
+    approval_required: true
+  implementer:
+    profile: implementer
+    model: code
+    toolsets: [file, terminal]
+    workspace: worktree
+    side_effects: local-git
+    approval_required: true
+  reviewer:
+    profile: reviewer
+    model: reasoning
+    toolsets: [file, terminal]
+    workspace: worktree
+    side_effects: local-git
+    approval_required: true
+  release-captain:
+    profile: release
+    model: balanced
+    toolsets: [file, terminal]
+    workspace: worktree
+    side_effects: remote-github
+    approval_required: true
+  operator-notifier:
+    profile: default
+    model: fast
+    toolsets: []
+    workspace: scratch
+    side_effects: none
+    approval_required: false
+
+rules:
+  - required roles must be present before their phase starts
+  - missing or disabled profile fails closed
+  - local-git and remote-github side effects require a persisted approval gate even when approval_required is omitted or false
+  - no implicit fallback to default profile for a missing route

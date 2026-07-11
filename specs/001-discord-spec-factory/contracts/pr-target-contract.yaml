@@ -1,0 +1,24 @@
+# Contract: GitHub PR Target Handoff
+
+schema_version: 1
+kind: discord_spec_factory_pr_target
+
+required_fields:
+  repository: "owner/name or local remote slug"
+  base_branch: "main"
+  feature_branch: "spec/{workflow_id}-{slug}"
+  title: "[Spec Factory] {feature_title}"
+  body_sections:
+    - Summary
+    - Source
+    - Spec Kit Artifacts
+    - Discord Approval Evidence
+    - Test Evidence
+    - Rollback Plan
+  approval_gate_id: required before remote side effects
+
+rules:
+  - handoff validation can run without GitHub credentials
+  - creating remote issues, branches, or PRs requires explicit release-captain approval
+  - PR body must link to source/context packet, feature directory, workflow thread, and test evidence
+  - rollback plan is mandatory even if the implementation is docs-only

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Discord Spec Factory Source Context Packet",
+  "type": "object",
+  "required": ["schema_version", "workflow_id", "source", "content", "repository"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "workflow_id": {"type": "string", "pattern": "^dsf_[a-z0-9_]+$"},
+    "source": {
+      "type": "object",
+      "required": ["platform", "channel_id", "message_id", "author_id", "created_at", "received_at"],
+      "properties": {
+        "platform": {"const": "discord"},
+        "channel_id": {"type": "string", "minLength": 1},
+        "parent_channel_id": {"type": ["string", "null"]},
+        "thread_id": {"type": ["string", "null"]},
+        "message_id": {"type": "string", "minLength": 1},
+        "author_id": {"type": "string", "minLength": 1},
+        "author_display": {"type": ["string", "null"]},
+        "author_roles": {"type": "array", "items": {"type": "string"}},
+        "created_at": {"type": "string"},
+        "received_at": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "content": {
+      "type": "object",
+      "required": ["text", "text_sha256", "attachments", "voice"],
+      "properties": {
+        "text": {"type": "string"},
+        "text_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "attachments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "filename", "content_type", "size", "supported"],
+            "properties": {
+              "id": {"type": "string"},
+              "filename": {"type": "string"},
+              "content_type": {"type": ["string", "null"]},
+              "size": {"type": ["integer", "null"], "minimum": 0},
+              "cached_path": {"type": ["string", "null"]},
+              "sha256": {"type": ["string", "null"]},
+              "supported": {"type": "boolean"},
+              "warning": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        "voice": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": false
+    },
+    "repository": {
+      "type": "object",
+      "required": ["path", "default_branch"],
+      "properties": {
+        "path": {"type": "string"},
+        "default_branch": {"type": "string"},
+        "remote": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "discord": {
+      "type": "object",
+      "properties": {"workflow_thread_id": {"type": ["string", "null"]}},
+      "additionalProperties": true
+    },
+    "spec_kit": {
+      "type": "object",
+      "properties": {"feature_directory": {"type": ["string", "null"]}},
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}
