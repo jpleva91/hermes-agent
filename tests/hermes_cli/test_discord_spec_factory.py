@@ -12,6 +12,7 @@ from hermes_cli.discord_spec_factory import (
     build_pr_handoff_packet,
     build_source_context_packet,
     initialize_local_spec_kit_seed,
+    start_spec_kit_contract_seed,
     process_synthetic_discord_intake,
     register_workflow_thread,
     validate_intake_binding,
@@ -331,9 +332,10 @@ def test_workflow_thread_registry_maps_thread_to_workflow(tmp_path):
 
 def test_gate_decision_requires_authorized_actor_and_thread_mapping():
     gate = {
-        "gate_id": "clarify-1",
+        "gate_id": "approve-1",
         "workflow_id": "dsf_abc123",
-        "phase": "clarify",
+        "phase": "approval",
+        "type": "approval",
         "status": "pending",
         "required_actor_ids": ["actor-1"],
         "required_role_ids": ["role-reviewer"],
@@ -360,6 +362,77 @@ def test_gate_decision_requires_authorized_actor_and_thread_mapping():
     assert approved["ok"] is True
     assert approved["gate"]["status"] == "approved"
     assert approved["gate"]["decision"]["actor_id"] == "actor-2"
+
+
+def test_approval_gate_rejects_arbitrary_free_text_even_from_authorized_actor():
+    gate = {
+        "gate_id": "approve-plan",
+        "workflow_id": "dsf_abc123",
+        "phase": "approval",
+        "type": "approval",
+        "status": "pending",
+        "options": ["approve", "reject"],
+        "required_role_ids": ["role-reviewer"],
+    }
+    registry = {"threads": {"thread-1": {"workflow_id": "dsf_abc123"}}}
+
+    result = apply_gate_decision(
+        gate,
+        {"thread_id": "thread-1", "message_id": "m1", "author_id": "actor-1", "author_roles": ["role-reviewer"], "text": "looks good to me"},
+        registry=registry,
+        decision="answered",
+        decided_at="2026-07-10T00:00:02Z",
+    )
+
+    assert result["ok"] is False
+    assert "explicit approval" in result["reason"]
+    assert result["gate"]["status"] == "pending"
+
+
+def test_clarify_gate_accepts_authorized_free_text_answer_without_approval():
+    gate = {
+        "gate_id": "clarify-scope",
+        "workflow_id": "dsf_abc123",
+        "phase": "clarify",
+        "type": "clarify",
+        "status": "pending",
+        "required_role_ids": ["role-reviewer"],
+    }
+    registry = {"threads": {"thread-1": {"workflow_id": "dsf_abc123"}}}
+
+    result = apply_gate_decision(
+        gate,
+        {"thread_id": "thread-1", "message_id": "m1", "author_id": "actor-1", "author_roles": ["role-reviewer"], "text": "It needs a config-only rollout."},
+        registry=registry,
+        decision="answered",
+        decided_at="2026-07-10T00:00:02Z",
+    )
+
+    assert result["ok"] is True
+    assert result["gate"]["status"] == "answered"
+    assert result["gate"]["decision"]["value"] == "answered"
+    assert result["gate"]["decision"]["answer"] == "It needs a config-only rollout."
+
+
+def test_spec_kit_contract_seed_is_honest_about_loading_without_official_execution(tmp_path):
+    repo = _repo(tmp_path)
+    workflow_dir = repo / ".specify" / "workflows" / "speckit"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "workflow.yml").write_text(
+        "workflow:\n  id: speckit\n  version: '1'\nsteps:\n  - id: specify\n    type: task\n",
+        encoding="utf-8",
+    )
+    packet = build_source_context_packet(
+        _message(),
+        repository={"path": str(repo), "default_branch": "main"},
+        received_at="2026-07-10T00:00:01Z",
+    )
+
+    state = start_spec_kit_contract_seed(packet, authority={"allowed_role_ids": ["role-reviewer"]})
+
+    assert state["spec_kit"]["official_workflow_loaded"] is True
+    assert state["spec_kit"]["official_workflow_executed"] is False
+    assert state["events"][0]["type"] == "spec_kit_workflow_contract_loaded"
 
 
 def test_gate_decision_fails_closed_when_constraints_are_absent():

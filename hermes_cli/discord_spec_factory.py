@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 PLACEHOLDER_CHANNEL_ID = "DISCORD_SPEC_FACTORY_INTAKE_CHANNEL_ID"
 REQUIRED_FACTORY_ROLES = (
@@ -43,6 +43,25 @@ class ValidationResult:
 
     ok: bool
     reason: str = ""
+
+
+class SpecKitContractSeedRuntime(Protocol):
+    """Narrow adapter for loading the repository-local Spec Kit workflow contract.
+
+    This is deliberately not an official Spec Kit execution runtime. It reads
+    the repository-local workflow contract and seeds Hermes-owned state only.
+    """
+
+    def start_contract_seed(
+        self,
+        *,
+        workflow_path: Path,
+        repository_path: Path,
+        workflow_id: str,
+        inputs: Mapping[str, Any],
+        authority_packet: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        ...
 
 
 def _as_nonempty_str(value: Any) -> str:
@@ -157,6 +176,146 @@ def _repo_path_from_packet(packet: Mapping[str, Any]) -> Path:
 
 def _relative_posix(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def _official_workflow_path(repo: Path) -> Path:
+    path = repo / ".specify" / "workflows" / "speckit" / "workflow.yml"
+    if not path.is_file():
+        raise ValueError("repository-local .specify/workflows/speckit/workflow.yml is required")
+    resolved = path.resolve(strict=True)
+    if not _is_relative_to(resolved, repo):
+        raise ValueError("Spec Kit workflow path escapes repository")
+    return resolved
+
+
+def load_thread_registry(repository_path: str | Path) -> dict[str, Any]:
+    repo = _ensure_repository_root(Path(repository_path))
+    registry_path = _safe_repo_path(repo, Path(".hermes") / "discord-spec-factory" / "thread-registry.json")
+    if not registry_path.exists():
+        return {"schema_version": 1, "threads": {}, "workflows": {}}
+    return _read_json(registry_path)
+
+
+def _workflow_state_path(repo: Path, workflow_state: Mapping[str, Any]) -> Path:
+    artifact_paths = workflow_state.get("artifact_paths") if isinstance(workflow_state.get("artifact_paths"), Mapping) else {}
+    state_relative = _as_nonempty_str(artifact_paths.get("workflow_state"))
+    if not state_relative:
+        feature_directory = _as_nonempty_str(workflow_state.get("feature_directory"))
+        if not feature_directory:
+            raise ValueError("workflow_state.feature_directory is required")
+        state_relative = str(Path(feature_directory) / "workflow-state.json")
+    return _safe_repo_path(repo, state_relative)
+
+
+def persist_workflow_state(repository_path: str | Path, workflow_state: Mapping[str, Any]) -> dict[str, Any]:
+    repo = _ensure_repository_root(Path(repository_path))
+    state_path = _workflow_state_path(repo, workflow_state)
+    relative = _relative_posix(state_path, repo)
+    state = copy.deepcopy(dict(workflow_state))
+    _safe_write_json(repo, relative, state)
+    return state
+
+
+def load_workflow_state_for_thread(repository_path: str | Path, thread_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    repo = _ensure_repository_root(Path(repository_path))
+    registry = load_thread_registry(repo)
+    entry = (registry.get("threads") or {}).get(_as_nonempty_str(thread_id))
+    if not isinstance(entry, Mapping):
+        raise ValueError("thread is not registered to a workflow")
+    feature_directory = _as_nonempty_str(entry.get("feature_directory"))
+    if not feature_directory:
+        raise ValueError("thread registry entry is missing feature_directory")
+    state_path = _safe_repo_path(repo, Path(feature_directory) / "workflow-state.json")
+    if not state_path.exists():
+        raise ValueError("registered workflow state does not exist")
+    return registry, _read_json(state_path)
+
+
+class LocalSpecKitContractSeedRuntime:
+    """Safe local adapter for the repository-local Spec Kit workflow contract.
+
+    The adapter loads `.specify/workflows/speckit/workflow.yml` as the workflow
+    contract and initializes durable state/gates. It does not execute an
+    official Spec Kit engine, shell out, or touch networks.
+    """
+
+    def start_contract_seed(
+        self,
+        *,
+        workflow_path: Path,
+        repository_path: Path,
+        workflow_id: str,
+        inputs: Mapping[str, Any],
+        authority_packet: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        import yaml
+
+        workflow_doc = yaml.safe_load(workflow_path.read_text(encoding="utf-8")) or {}
+        workflow_meta = workflow_doc.get("workflow") if isinstance(workflow_doc, Mapping) else None
+        if not isinstance(workflow_meta, Mapping) or _as_nonempty_str(workflow_meta.get("id")) != "speckit":
+            raise ValueError("official Spec Kit workflow.yml must declare workflow.id=speckit")
+        steps = workflow_doc.get("steps") if isinstance(workflow_doc, Mapping) else None
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("official Spec Kit workflow.yml must declare workflow steps")
+
+        title = _as_nonempty_str(inputs.get("spec")) or workflow_id
+        feature_directory = f"specs/{workflow_id}-{_slug(title, limit=40)}"
+        gates: list[dict[str, Any]] = []
+        phase_status: dict[str, str] = {}
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            step_id = _as_nonempty_str(step.get("id"))
+            if not step_id:
+                continue
+            if step.get("type") == "gate":
+                gates.append(
+                    {
+                        "gate_id": step_id,
+                        "workflow_id": workflow_id,
+                        "phase": step_id,
+                        "status": "pending",
+                        "message": _as_nonempty_str(step.get("message")) or None,
+                        "options": [str(v) for v in (step.get("options") or [])],
+                        "required_role_ids": list(authority_packet.get("allowed_role_ids") or []),
+                        "required_actor_ids": list(authority_packet.get("allowed_user_ids") or []),
+                    }
+                )
+            else:
+                phase_status[step_id] = "pending"
+        if "specify" in phase_status:
+            phase_status["specify"] = "active"
+
+        return {
+            "schema_version": 1,
+            "workflow_id": workflow_id,
+            "feature_directory": feature_directory,
+            "current_phase": "specify",
+            "phase_status": phase_status,
+            "source_packet_path": f".hermes/discord-spec-factory/source-packets/{workflow_id}.json",
+            "artifact_paths": {
+                "spec": f"{feature_directory}/spec.md",
+                "workflow_state": f"{feature_directory}/workflow-state.json",
+            },
+            "gates": gates,
+            "events": [
+                {
+                    "type": "spec_kit_workflow_contract_loaded",
+                    "at": _now_iso(),
+                    "workflow_path": _relative_posix(workflow_path, repository_path),
+                    "runtime": "local-speckit-contract-seed",
+                    "official_spec_kit_workflow_executed": False,
+                }
+            ],
+            "discord": {"workflow_thread_id": None},
+            "spec_kit": {
+                "feature_directory": feature_directory,
+                "official_workflow_loaded": True,
+                "official_workflow_executed": False,
+                "workflow_id": _as_nonempty_str(workflow_meta.get("id")),
+                "workflow_version": _as_nonempty_str(workflow_meta.get("version")) or None,
+            },
+        }
 
 
 def _profile_exists(profile: str, hermes_home: Path | str | None, existing_profiles: set[str] | None) -> bool:
@@ -427,11 +586,108 @@ def initialize_local_spec_kit_seed(
     return state
 
 
+def start_spec_kit_contract_seed(
+    packet: Mapping[str, Any],
+    *,
+    runtime: SpecKitContractSeedRuntime | None = None,
+    authority: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load the repository-local Spec Kit workflow contract and persist seed state.
+
+    This does not execute the official Spec Kit runtime. It only records that
+    the workflow contract was found and used to initialize Hermes-local state.
+    Exact duplicate source packets resume existing state without re-seeding.
+    """
+
+    workflow_id = _as_nonempty_str(packet.get("workflow_id"))
+    if not workflow_id:
+        raise ValueError("packet.workflow_id is required")
+    repo = _repo_path_from_packet(packet)
+    workflow_path = _official_workflow_path(repo)
+    authority_packet = copy.deepcopy(dict(authority or {}))
+    content = packet.get("content") if isinstance(packet.get("content"), Mapping) else {}
+    packet_relative = Path(".hermes") / "discord-spec-factory" / "source-packets" / f"{workflow_id}.json"
+    packet_path = _safe_repo_path(repo, packet_relative)
+    if packet_path.exists():
+        existing_packet = _read_json(packet_path)
+        existing_feature_directory = _as_nonempty_str((existing_packet.get("spec_kit") or {}).get("feature_directory"))
+        existing_hash = _as_nonempty_str(existing_packet.get("source_packet_sha256")) or _packet_identity(existing_packet)
+        incoming_probe = copy.deepcopy(dict(packet))
+        if existing_feature_directory:
+            incoming_probe.setdefault("spec_kit", {})["feature_directory"] = existing_feature_directory
+        incoming_hash = _packet_identity(incoming_probe)
+        if existing_feature_directory and existing_hash == incoming_hash:
+            existing_state_path = _safe_repo_path(repo, Path(existing_feature_directory) / "workflow-state.json")
+            if existing_state_path.exists():
+                return _read_json(existing_state_path)
+
+    runtime = runtime or LocalSpecKitContractSeedRuntime()
+    state = copy.deepcopy(dict(runtime.start_contract_seed(
+        workflow_path=workflow_path,
+        repository_path=repo,
+        workflow_id=workflow_id,
+        inputs={
+            "spec": str(content.get("text") or ""),
+            "integration": "hermes",
+            "scope": "contract-seed",
+        },
+        authority_packet=authority_packet,
+    )))
+    if _as_nonempty_str(state.get("workflow_id")) != workflow_id:
+        raise ValueError("Spec Kit contract seed returned mismatched workflow_id")
+    feature_directory = _as_nonempty_str(state.get("feature_directory"))
+    if not feature_directory:
+        raise ValueError("Spec Kit contract seed returned no feature_directory")
+
+    packet_with_links = copy.deepcopy(dict(packet))
+    packet_with_links.setdefault("spec_kit", {})["feature_directory"] = feature_directory
+    packet_with_links["source_packet_sha256"] = _packet_identity(packet_with_links)
+    if packet_path.exists():
+        existing_packet = _read_json(packet_path)
+        existing_hash = _as_nonempty_str(existing_packet.get("source_packet_sha256")) or _packet_identity(existing_packet)
+        if existing_hash != packet_with_links["source_packet_sha256"]:
+            state.setdefault("events", []).append({
+                "type": "source_packet_conflict_observed",
+                "at": _now_iso(),
+                "source_packet_path": _relative_posix(packet_path, repo),
+                "existing_source_packet_sha256": existing_hash,
+                "incoming_source_packet_sha256": packet_with_links["source_packet_sha256"],
+            })
+    else:
+        _safe_write_json(repo, packet_relative, packet_with_links)
+
+    spec_path = _as_nonempty_str((state.get("artifact_paths") or {}).get("spec"))
+    if spec_path and not _safe_repo_path(repo, spec_path).exists():
+        _safe_write_text(
+            repo,
+            spec_path,
+            f"# {str(content.get('text') or workflow_id).strip() or workflow_id}\n\n"
+            f"Source workflow: `{workflow_id}`\n\n"
+            "Status: Spec Kit workflow contract loaded; official Spec Kit execution is not wired yet.\n",
+        )
+    state["source_packet_path"] = _relative_posix(packet_path, repo)
+    state.setdefault("artifact_paths", {})["workflow_state"] = f"{feature_directory}/workflow-state.json"
+    state.setdefault("spec_kit", {})["official_workflow_loaded"] = True
+    state.setdefault("spec_kit", {})["official_workflow_executed"] = False
+    return persist_workflow_state(repo, state)
+
+
 def build_thread_open_request(packet: Mapping[str, Any], workflow_state: Mapping[str, Any]) -> dict[str, Any]:
     source = packet.get("source", {}) if isinstance(packet.get("source"), Mapping) else {}
     content = packet.get("content", {}) if isinstance(packet.get("content"), Mapping) else {}
     workflow_id = _as_nonempty_str(packet.get("workflow_id"))
     thread_name = workflow_thread_name(workflow_id, str(content.get("text") or workflow_id))
+    gates = workflow_state.get("gates") if isinstance(workflow_state.get("gates"), list) else []
+    pending_gate = next((g for g in gates if isinstance(g, Mapping) and g.get("status") == "pending"), None)
+    options = [str(v) for v in ((pending_gate or {}).get("options") or []) if str(v).strip()]
+    authorized_roles = [str(v) for v in ((pending_gate or {}).get("required_role_ids") or []) if str(v).strip()]
+    authorized_actors = [str(v) for v in ((pending_gate or {}).get("required_actor_ids") or []) if str(v).strip()]
+    next_action = (
+        f"Resolve gate `{pending_gate.get('gate_id')}`" if isinstance(pending_gate, Mapping) else "Review the seeded Spec Kit packet and wait for the next explicit gate."
+    )
+    actor_line = ", ".join([*(f"role:{r}" for r in authorized_roles), *(f"user:{a}" for a in authorized_actors)]) or "configured maintainers only"
+    options_line = ", ".join(options) if options else "clarify gates accept free-text answers; approval gates require /approve or /reject"
+    timeout = _as_nonempty_str((pending_gate or {}).get("timeout")) or "no automatic timeout configured"
     return {
         "schema_version": 1,
         "adapter_method": "create_handoff_thread",
@@ -440,10 +696,14 @@ def build_thread_open_request(packet: Mapping[str, Any], workflow_state: Mapping
         "parent_channel_id": _as_nonempty_str(source.get("parent_channel_id")) or _as_nonempty_str(source.get("channel_id")),
         "source_message_id": _as_nonempty_str(source.get("message_id")),
         "thread_name": thread_name,
-        "initial_thread_brief": (
-            f"Workflow `{workflow_id}` initialized at `{workflow_state.get('feature_directory')}`. "
-            f"Source message `{source.get('message_id')}`. Current phase: `{workflow_state.get('current_phase')}`."
-        ),
+        "initial_thread_brief": "\n".join([
+            f"Workflow `{workflow_id}` initialized at `{workflow_state.get('feature_directory')}`.",
+            f"Source message `{source.get('message_id')}`. Current phase: `{workflow_state.get('current_phase')}`.",
+            f"Required next action: {next_action}.",
+            f"Authorized actor/role: {actor_line}.",
+            f"Options: {options_line}.",
+            f"Timeout: {timeout}.",
+        ]),
     }
 
 
@@ -606,7 +866,20 @@ def apply_gate_decision(
     normalized_decision = _as_nonempty_str(decision).lower()
     if normalized_decision not in {"approved", "rejected", "answered"}:
         return {"ok": False, "reason": "decision must be approved, rejected, or answered", "gate": updated_gate}
-    updated_gate["status"] = normalized_decision if normalized_decision != "answered" else "approved"
+    gate_kind = (_as_nonempty_str(updated_gate.get("type")) or _as_nonempty_str(updated_gate.get("phase")) or _as_nonempty_str(updated_gate.get("gate_id"))).lower()
+    is_clarify_gate = "clarify" in gate_kind or "question" in gate_kind
+    if normalized_decision == "answered" and not is_clarify_gate:
+        updated_gate.setdefault("events", []).append({
+            "type": "gate_decision_denied",
+            "actor_id": actor_id,
+            "message_id": _as_nonempty_str(reply.get("message_id")),
+            "at": decided_at or _now_iso(),
+            "reason": "approval gate requires explicit approval option",
+        })
+        return {"ok": False, "reason": "approval gate requires explicit approval option", "gate": updated_gate}
+    if normalized_decision in {"approved", "rejected"} and is_clarify_gate:
+        return {"ok": False, "reason": "clarify gate requires an answer", "gate": updated_gate}
+    updated_gate["status"] = normalized_decision
     updated_gate["decision"] = {
         "value": normalized_decision,
         "actor_id": actor_id,
@@ -614,7 +887,46 @@ def apply_gate_decision(
         "thread_id": thread_id,
         "timestamp": decided_at or _now_iso(),
     }
+    if normalized_decision == "answered":
+        updated_gate["decision"]["answer"] = str(reply.get("text") or "")
     return {"ok": True, "gate": updated_gate}
+
+
+def apply_thread_reply_to_workflow_state(
+    repository_path: str | Path,
+    reply: Mapping[str, Any],
+    *,
+    decision: str,
+    decided_at: str | None = None,
+) -> dict[str, Any]:
+    """Persist a registered Discord workflow-thread reply into pending gates."""
+
+    repo = _ensure_repository_root(Path(repository_path))
+    thread_id = _as_nonempty_str(reply.get("thread_id"))
+    if not thread_id:
+        return {"ok": False, "reason": "reply.thread_id is required"}
+    registry, state = load_workflow_state_for_thread(repo, thread_id)
+    gates = state.get("gates")
+    if not isinstance(gates, list):
+        return {"ok": False, "reason": "workflow state gates are malformed", "workflow_state": state}
+    for idx, gate in enumerate(gates):
+        if not isinstance(gate, Mapping) or gate.get("status") != "pending":
+            continue
+        result = apply_gate_decision(gate, reply, registry=registry, decision=decision, decided_at=decided_at)
+        if result.get("ok"):
+            state["gates"][idx] = result["gate"]
+            state.setdefault("events", []).append({
+                "type": "gate_decision_applied",
+                "at": decided_at or _now_iso(),
+                "gate_id": result["gate"].get("gate_id"),
+                "decision": result["gate"].get("decision"),
+            })
+            return {"ok": True, "workflow_state": persist_workflow_state(repo, state), "gate": result["gate"]}
+        if result.get("reason") in {"actor is not authorized for gate", "gate has no authorization constraint"}:
+            state["gates"][idx] = result.get("gate", gate)
+            persist_workflow_state(repo, state)
+            return {"ok": False, "reason": result.get("reason"), "workflow_state": state}
+    return {"ok": False, "reason": "no pending gate for registered workflow thread", "workflow_state": state}
 
 
 def validate_role_routes(

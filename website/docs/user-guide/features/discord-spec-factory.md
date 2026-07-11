@@ -4,7 +4,7 @@ title: Discord Spec Factory
 
 # Discord Spec Factory (local steel thread)
 
-The Discord Spec Factory is a Hermes-native intake path for turning a Discord request into repository-local Spec Kit artifacts. In this implementation stage it is intentionally local and fail-closed: tests use synthetic Discord events, temporary repositories, and packet builders only. No live Discord, GitHub, Kanban, gateway restart, remote git, or credential access is required. The official repository-local `.specify` workflow/scripts are not executed yet; the helper is named `initialize_local_spec_kit_seed()` to keep that boundary explicit.
+The Discord Spec Factory is a Hermes-native, disabled-by-default gateway intake path for turning a Discord request into repository-local Spec Kit contract-seed artifacts and a dedicated workflow thread. Tests use synthetic Discord events, temporary repositories, and fake adapters; no live Discord, GitHub, Kanban, gateway restart, remote git, or credential access is required. The repository-local `.specify/workflows/speckit/workflow.yml` contract is loaded and validated, but the official Spec Kit workflow engine/scripts are not executed yet.
 
 ## What is canonical
 
@@ -23,6 +23,26 @@ Production intake must stay disabled until an operator supplies concrete binding
 - At least one `allowed_role_ids` or `allowed_user_ids` entry is required.
 - `repository.path` and `repository.default_branch` are required before workflow initialization and handoff.
 - Existing Discord `channel_prompts`, `channel_skill_bindings`, and adapter `create_handoff_thread` are the intended gateway surfaces; this feature does not introduce a second gateway state engine.
+
+The binding lives under `discord.spec_factory` in `~/.hermes/config.yaml`. Keep it disabled until every placeholder is replaced:
+
+```yaml
+discord:
+  spec_factory:
+    enabled: false
+    channel_id: DISCORD_SPEC_FACTORY_INTAKE_CHANNEL_ID
+    allowed_role_ids:
+      - DISCORD_MAINTAINER_ROLE_ID
+    allowed_user_ids: []
+    repository:
+      path: /absolute/path/to/target-repository
+      default_branch: main
+    kanban_projection:
+      enabled: false
+      mode: disabled
+```
+
+Setting `enabled: false` disables both new intake and registered workflow-thread gate replies. The gateway rejects placeholders, empty/wildcard channels, missing allowlists, unmarked repository roots, and path/symlink escapes.
 
 ## Local validation
 
@@ -43,7 +63,7 @@ The tests verify:
 - exact duplicate source packets resume existing state without overwrite;
 - edited same-message source content is recorded as an observation without mutating the original packet;
 - repository writes are confined to a real marked repository and reject symlink escapes;
-- thread-open requests target the existing `create_handoff_thread` adapter seam without calling it;
+- gateway intake calls the existing `create_handoff_thread` seam exactly once per deduplicated source message and persists the returned thread ID;
 - approval gate decisions require an authorized actor and registered workflow thread;
 - role/profile/model dispatch packets validate profile existence in dry-run mode;
 - Kanban projection can be disabled as a derived no-op;

@@ -43,7 +43,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -8573,6 +8573,191 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    def _discord_spec_factory_config(self) -> dict[str, Any]:
+        cfg = _load_gateway_config()
+        discord_cfg = cfg.get("discord") if isinstance(cfg, dict) else None
+        spec_cfg = discord_cfg.get("spec_factory") if isinstance(discord_cfg, dict) else None
+        return spec_cfg if isinstance(spec_cfg, dict) else {}
+
+    def _discord_spec_factory_intake_binding(self, event: MessageEvent) -> Optional[dict[str, Any]]:
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return None
+        binding = self._discord_spec_factory_config()
+        if not binding:
+            return None
+        parent_or_chat = str(getattr(source, "parent_chat_id", None) or getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        # Only top-level intake channel messages start workflows. Replies in
+        # registered workflow threads are handled by the gate seam below.
+        if thread_id:
+            return None
+        if parent_or_chat != str(binding.get("channel_id") or ""):
+            return None
+        return dict(binding)
+
+    def _discord_spec_factory_message(self, event: MessageEvent) -> dict[str, Any]:
+        source = event.source
+        metadata = getattr(event, "metadata", {}) or {}
+        return {
+            "channel_id": str(getattr(source, "chat_id", "") or ""),
+            "parent_channel_id": str(getattr(source, "parent_chat_id", "") or "") or None,
+            "thread_id": str(getattr(source, "thread_id", "") or "") or None,
+            "message_id": str(getattr(event, "message_id", None) or getattr(source, "message_id", "") or ""),
+            "author_id": str(getattr(source, "user_id", "") or ""),
+            "author_display": getattr(source, "user_name", None),
+            "author_roles": list(metadata.get("author_roles") or metadata.get("role_ids") or []),
+            "created_at": getattr(event, "timestamp", datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "text": event.text or "",
+            "attachments": list(metadata.get("attachments") or []),
+            "voice": list(metadata.get("voice") or []),
+        }
+
+    async def _handle_discord_spec_factory_intake(self, event: MessageEvent) -> Optional[str]:
+        binding = self._discord_spec_factory_intake_binding(event)
+        if binding is None:
+            return None
+        from hermes_cli.discord_spec_factory import (
+            build_source_context_packet,
+            build_thread_open_request,
+            load_thread_registry,
+            load_workflow_state_for_thread,
+            persist_workflow_state,
+            register_workflow_thread,
+            start_spec_kit_contract_seed,
+            validate_intake_binding,
+            workflow_id_for_message,
+        )
+
+        validation = validate_intake_binding(binding)
+        if not validation.ok:
+            return None
+        message = self._discord_spec_factory_message(event)
+        if message["channel_id"] != str(binding.get("channel_id")):
+            return None
+        allowed_users = {str(v).strip() for v in (binding.get("allowed_user_ids") or []) if str(v).strip()}
+        allowed_roles = {str(v).strip() for v in (binding.get("allowed_role_ids") or []) if str(v).strip()}
+        author_roles = {str(v).strip() for v in message.get("author_roles", []) if str(v).strip()}
+        if message.get("author_id") not in allowed_users and not (author_roles & allowed_roles):
+            return None
+        repo_cfg = binding.get("repository") if isinstance(binding.get("repository"), dict) else {}
+        try:
+            packet = build_source_context_packet(message, repository=repo_cfg)
+            registry = load_thread_registry(repo_cfg.get("path"))
+            existing_thread_id = (registry.get("workflows") or {}).get(packet["workflow_id"])
+            state = None
+            if existing_thread_id:
+                _, state = load_workflow_state_for_thread(repo_cfg.get("path"), str(existing_thread_id))
+                state.setdefault("discord", {})["workflow_thread_id"] = str(existing_thread_id)
+                persist_workflow_state(repo_cfg.get("path"), state)
+            if state is None:
+                runtime = getattr(self, "_discord_spec_factory_runtime", None)
+                state = start_spec_kit_contract_seed(
+                    packet,
+                    runtime=runtime,
+                    authority={
+                        "mode": "discord-spec-factory",
+                        "allowed_role_ids": list(allowed_roles),
+                        "allowed_user_ids": list(allowed_users),
+                        "source_message_id": message.get("message_id"),
+                    },
+                )
+            request = build_thread_open_request(packet, state)
+            adapter = self.adapters.get(Platform.DISCORD)
+            thread_id = str(existing_thread_id) if existing_thread_id else None
+            if thread_id is None and adapter is not None and hasattr(adapter, "create_handoff_thread"):
+                thread_id = await adapter.create_handoff_thread(
+                    request["parent_channel_id"],
+                    request["thread_name"],
+                )
+            if not thread_id:
+                raise RuntimeError("create_handoff_thread did not return a workflow thread id")
+            entry = register_workflow_thread(
+                repo_cfg.get("path"),
+                workflow_state=state,
+                parent_channel_id=request["parent_channel_id"],
+                thread_id=str(thread_id),
+                source_message_id=request["source_message_id"],
+                thread_name=request["thread_name"],
+            )
+            state.setdefault("discord", {})["workflow_thread_id"] = entry["thread_id"]
+            persist_workflow_state(repo_cfg.get("path"), state)
+            # Scope note: execution/Kanban/GitHub dispatch is intentionally not
+            # wired in this gateway tranche. Operators get only repository-local
+            # source packets, workflow-state, and Discord thread gates until a
+            # reviewed production dispatcher seam exists.
+            if adapter is not None:
+                await adapter.send(
+                    request["parent_channel_id"],
+                    request["initial_thread_brief"],
+                    metadata={"thread_id": str(thread_id)},
+                )
+            return ""
+        except Exception as exc:
+            workflow_hint = None
+            try:
+                workflow_hint = workflow_id_for_message(str(message.get("channel_id") or ""), str(message.get("message_id") or ""))
+            except Exception:
+                workflow_hint = str(message.get("message_id") or "unknown")
+            logger.warning("Discord Spec Factory intake failed closed for workflow %s: %s", workflow_hint, exc, exc_info=True)
+            adapter = self.adapters.get(Platform.DISCORD)
+            if adapter is not None:
+                await adapter.send(
+                    str(message.get("channel_id")),
+                    f"Discord Spec Factory intake failed closed for workflow `{workflow_hint}`. Check gateway logs for the detailed error.",
+                )
+            return ""
+
+    def _discord_spec_factory_decision_for_reply(self, event: MessageEvent) -> Optional[str]:
+        raw = (event.text or "").strip().lower()
+        if raw in {"/approve", "approve", "approved"}:
+            return "approved"
+        if raw in {"/deny", "/reject", "deny", "reject", "rejected"}:
+            return "rejected"
+        if raw:
+            return "answered"
+        return None
+
+    async def _handle_discord_spec_factory_thread_reply(self, event: MessageEvent) -> Optional[str]:
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return None
+        thread_id = str(getattr(source, "thread_id", None) or getattr(source, "chat_id", "") or "")
+        if not thread_id:
+            return None
+        binding = self._discord_spec_factory_config()
+        if binding.get("enabled") is not True:
+            return None
+        repo_cfg = binding.get("repository") if isinstance(binding.get("repository"), dict) else {}
+        repo_path = repo_cfg.get("path")
+        if not repo_path:
+            return None
+        decision = self._discord_spec_factory_decision_for_reply(event)
+        if decision is None:
+            return None
+        from hermes_cli.discord_spec_factory import apply_thread_reply_to_workflow_state
+        metadata = getattr(event, "metadata", {}) or {}
+        reply = {
+            "thread_id": thread_id,
+            "message_id": str(getattr(event, "message_id", "") or ""),
+            "author_id": str(getattr(source, "user_id", "") or ""),
+            "author_roles": list(metadata.get("author_roles") or metadata.get("role_ids") or []),
+            "text": event.text or "",
+        }
+        try:
+            result = apply_thread_reply_to_workflow_state(repo_path, reply, decision=decision)
+        except Exception:
+            return None
+        if not result.get("ok"):
+            return None
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is not None:
+            await adapter.send(
+                str(getattr(source, "parent_chat_id", None) or getattr(source, "chat_id", "")),
+                f"Recorded Spec Factory gate decision: {decision}",
+                metadata={"thread_id": thread_id},
+            )
+        return ""
 
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
@@ -8752,6 +8937,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Discord Spec Factory is disabled by default and only consumes events
+        # that match an explicit, validated spec_factory binding or a registered
+        # workflow thread. It runs after normal gateway auth/adapter filtering so
+        # existing allowed-channel/auth behavior remains authoritative.
+        if not is_internal and getattr(source, "platform", None) == Platform.DISCORD:
+            _dsf_gate_reply = await self._handle_discord_spec_factory_thread_reply(event)
+            if _dsf_gate_reply is not None:
+                return _dsf_gate_reply
+            _dsf_intake = await self._handle_discord_spec_factory_intake(event)
+            if _dsf_intake is not None:
+                return _dsf_intake
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher

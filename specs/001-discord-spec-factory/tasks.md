@@ -63,7 +63,7 @@
 - [x] T020 [US1] Implement `build_source_context_packet()` in `hermes_cli/discord_spec_factory.py`
 - [x] T021 [US1] Implement `workflow_thread_name()` in `hermes_cli/discord_spec_factory.py`
 - [x] T022a [US1] Implement synthetic local intake helper `process_synthetic_discord_intake()` in `hermes_cli/discord_spec_factory.py`
-- [ ] T022b [US1] Integrate packet creation with a real gateway intake seam in `gateway/run.py` or a future narrow dispatcher module
+- [x] T022b [US1] Integrate packet creation with a disabled-by-default gateway intake/thread seam in `gateway/run.py`
 - [ ] T022c [US1] Wire official repository-local `.specify` workflow/script execution behind a safe non-network/process-risk integration, or explicitly keep using `initialize_local_spec_kit_seed()` until that exists
 
 **Checkpoint**: User Story 1 local steel thread is functional without Discord network access.
@@ -85,7 +85,7 @@
 
 - [x] T025 [US2] Add workflow thread registry functions in `hermes_cli/discord_spec_factory.py`
 - [x] T026 [US2] Add approval gate decision functions in `hermes_cli/discord_spec_factory.py`
-- [ ] T027 [US2] Wire Discord thread replies to gate decisions through existing gateway event handling in `gateway/run.py`
+- [x] T027 [US2] Wire Discord thread replies to clarify/approval gate decisions through existing gateway event handling in `gateway/run.py`
 
 **Checkpoint**: Human gates advance only through authorized workflow-thread replies.
 
@@ -105,7 +105,7 @@
 ### Implementation for User Story 3
 
 - [x] T030 [US3] Implement `validate_role_routes()` in `hermes_cli/discord_spec_factory.py`
-- [x] T031 [US3] Implement execution packet construction in `hermes_cli/discord_spec_factory.py`
+- [x] T031 [US3] Implement execution packet construction in `hermes_cli/discord_spec_factory.py` (packet-only; no gateway dispatch)
 - [ ] T032 [US3] Integrate profile dispatch only after approval gates in a future dispatcher module
 
 **Checkpoint**: Route validation is fail-closed before any worker process can spawn.
@@ -125,8 +125,8 @@
 
 ### Implementation for User Story 4
 
-- [x] T035 [US4] Implement Kanban projection packet builder in `hermes_cli/discord_spec_factory.py`
-- [x] T036 [US4] Implement PR target validation in `hermes_cli/discord_spec_factory.py`
+- [x] T035 [US4] Implement Kanban projection packet builder in `hermes_cli/discord_spec_factory.py` (packet-only; no gateway mutation)
+- [x] T036 [US4] Implement PR target validation in `hermes_cli/discord_spec_factory.py` (packet-only; remote effects disabled)
 - [ ] T037 [US4] Wire approved GitHub handoff to existing CLI/MCP surfaces without remote side effects in tests
 
 **Checkpoint**: Projection/handoff contracts are validated and remain derived from Spec Kit.
@@ -138,7 +138,7 @@
 - [x] T038 [P] Add user documentation for enabling the Discord Spec Factory in `website/docs/` after code integration is complete
 - [x] T039 [P] Add migration/rollback operator checklist to `website/docs/` or `docs/`
 - [x] T040a Run focused local helper and synthetic thread tests for changed paths
-- [ ] T040b Run focused gateway/platform tests after real gateway integration paths exist
+- [x] T040b Run focused gateway/platform tests for disabled-by-default intake/thread-gate paths
 - [x] T041 Run broader relevant pytest selection before PR handoff
 - [ ] T042 Prepare PR body with source PDF summary, Spec Kit artifacts, tests, and rollback plan
 

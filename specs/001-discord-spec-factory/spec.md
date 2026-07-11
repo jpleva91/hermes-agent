@@ -44,15 +44,15 @@ A maintainer can resolve Spec Kit clarify/review/approval gates inside the dedic
 
 ### User Story 3 - Execute with role/profile/model routing (Priority: P3)
 
-After approvals, Hermes routes each workflow phase to existing Hermes profiles and model tiers according to an explicit routing contract, with bounded permissions and auditable handoff packets.
+After approvals, Hermes can build auditable role/profile/model execution packets from an explicit routing contract. Live worker dispatch is intentionally not wired in this tranche.
 
 **Why this priority**: Existing Hermes profiles are the worker pool; the factory must route by role without making Kanban lanes the source of truth.
 
-**Independent Test**: Given a workflow plan with roles `spec-lead`, `architect`, `implementer`, `reviewer`, and `release-captain`, verify the router selects configured profiles/model tiers, denies missing required routes, and produces a deterministic execution packet for each phase.
+**Independent Test**: Given a workflow plan with roles `spec-lead`, `architect`, `implementer`, `reviewer`, and `release-captain`, verify route validation selects configured profiles/model tiers, denies missing required routes, and produces a deterministic packet without spawning workers.
 
 **Acceptance Scenarios**:
 
-1. **Given** all required routes exist, **When** the workflow enters implementation, **Then** Hermes dispatches the phase to the configured profile/model with the source/context packet, current Spec Kit artifact paths, and PR target contract.
+1. **Given** all required routes exist, **When** a future dispatcher requests an implementation packet, **Then** Hermes can build a packet for the configured profile/model with the source/context packet, current Spec Kit artifact paths, and side-effect boundary.
 2. **Given** a required route is missing or disabled, **When** Hermes attempts dispatch, **Then** it fails closed, records the missing route, and asks for human repair in the workflow thread.
 3. **Given** a worker proposes destructive operations or PR creation, **When** the action crosses the configured permission boundary, **Then** Hermes requires the relevant approval gate before proceeding.
 
@@ -60,17 +60,17 @@ After approvals, Hermes routes each workflow phase to existing Hermes profiles a
 
 ### User Story 4 - Project optionally to Kanban and hand off to GitHub (Priority: P4)
 
-A maintainer can opt into Kanban projection and GitHub handoff without making either one replace Spec Kit as canonical workflow state.
+A maintainer can validate Kanban projection and GitHub handoff packets without making either one replace Spec Kit as canonical workflow state. Live Kanban/GitHub wiring remains future work.
 
 **Why this priority**: Kanban and GitHub are valuable operator surfaces, but the corrected scope explicitly says Kanban is not the source of truth.
 
-**Independent Test**: Enable Kanban projection for a workflow, complete a phase, and verify that Kanban cards mirror Spec Kit phase status while the canonical state remains in Spec Kit artifacts; then verify the GitHub handoff packet targets the configured base branch and repository.
+**Independent Test**: Build a Kanban projection packet for a workflow and verify canonical state remains in Spec Kit artifacts; then verify the GitHub handoff packet targets the configured base branch and repository with remote effects disabled.
 
 **Acceptance Scenarios**:
 
 1. **Given** Kanban projection is disabled, **When** a workflow advances, **Then** no Kanban cards are required and Spec Kit state still advances.
-2. **Given** Kanban projection is enabled, **When** a phase starts or completes, **Then** Hermes updates mirror cards with links back to the Spec Kit feature directory and Discord thread.
-3. **Given** a workflow is ready for handoff, **When** approval is granted, **Then** Hermes prepares a GitHub handoff with target repository, base branch, branch naming, PR title/body, test evidence, and rollback notes.
+2. **Given** Kanban projection is enabled in packet-only mode, **When** a phase starts or completes, **Then** Hermes builds mirror-card requests with links back to the Spec Kit feature directory and Discord thread without mutating Kanban.
+3. **Given** a workflow is ready for handoff, **When** approval evidence is supplied, **Then** Hermes builds a GitHub handoff packet with target repository, base branch, branch naming, PR title/body, test evidence, and rollback notes while remote effects remain disabled.
 
 ### Edge Cases
 
@@ -95,7 +95,7 @@ A maintainer can opt into Kanban projection and GitHub handoff without making ei
 - **FR-006**: Hermes MUST support async clarify gates in the workflow thread and persist answers back to Spec Kit state with actor and Discord message provenance.
 - **FR-007**: Hermes MUST support review/approval gates that fail closed when the actor lacks required permissions, when the route is ambiguous, or when Discord/thread delivery fails.
 - **FR-008**: Hermes MUST define a role/profile/model routing contract for at least `intake-triage`, `spec-lead`, `architect`, `implementer`, `reviewer`, `release-captain`, and `operator-notifier` roles.
-- **FR-009**: Hermes MUST route execution across existing Hermes profiles by configured role, profile name, toolset allowance, model/provider/tier, workspace boundary, and approval requirements.
+- **FR-009**: Hermes MUST validate execution packet routing across existing Hermes profiles by configured role, profile name, toolset allowance, model/provider/tier, workspace boundary, and approval requirements; live dispatch is future work.
 - **FR-010**: Hermes MUST keep Kanban projection optional and derived; Kanban card status MUST NOT be treated as canonical workflow state for Spec Kit progress.
 - **FR-011**: Hermes MUST define a PR target contract including repository, base branch, feature branch naming, commit policy, PR title/body template, required evidence, and rollback instructions.
 - **FR-012**: Hermes MUST handle text, Discord attachments, and voice notes; attachments MUST be cached/referenced through existing safe media handling and voice notes MUST use existing transcription behavior when available.
@@ -121,7 +121,7 @@ A maintainer can opt into Kanban projection and GitHub handoff without making ei
 
 - **SC-001**: 100% of accepted Discord intake messages produce exactly one canonical Spec Kit workflow ID in repeat/deduplication tests.
 - **SC-002**: 100% of approval-gated transitions remain blocked when the actor lacks permission or the route is missing.
-- **SC-003**: A maintainer can trace any generated PR handoff back to the original Discord message, source packet, Spec Kit feature directory, and approval messages in under 2 minutes.
+- **SC-003**: A maintainer can trace any generated PR handoff packet back to the original Discord message, source packet, Spec Kit feature directory, and approval messages in under 2 minutes.
 - **SC-004**: Kanban projection can be disabled with zero failing core workflow tests and no loss of Spec Kit state advancement.
 - **SC-005**: Synthetic gateway restart tests recover workflow/thread association from persisted state without relying on in-memory objects.
 - **SC-006**: The MVP steel thread runs locally without live Discord, GitHub, gateway restart, remote git, or credentials by using synthetic events and temp Hermes homes.
@@ -129,7 +129,7 @@ A maintainer can opt into Kanban projection and GitHub handoff without making ei
 ## Assumptions
 
 - The v1 implementation runs inside Hermes Agent and uses the existing Discord gateway adapter rather than a separate service.
-- Official Spec Kit 0.12.10 with `integration=hermes` is the canonical workflow engine for this worktree.
+- The repository-local `.specify/workflows/speckit/workflow.yml` contract can be loaded in this worktree; the official Spec Kit engine is not executed by this tranche.
 - Existing Hermes profiles are pre-created by the operator; this feature validates and routes to them but does not create the user's 21 live profiles.
 - The source of truth is repository-local Spec Kit artifacts/state under the repository; Discord threads, Kanban, and GitHub are projections or interfaces. Official Spec Kit workflow execution remains a future unchecked integration task.
 - Development and tests use isolated temp homes/configs and synthetic Discord events; no live config, credentials, gateway restart, remote git, or live profile mutation is allowed.

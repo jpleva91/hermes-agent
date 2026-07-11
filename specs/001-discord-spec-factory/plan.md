@@ -6,13 +6,13 @@
 
 ## Summary
 
-Build a Hermes-native software factory where Discord is the intake and collaboration surface, Spec Kit is the canonical persisted workflow state, existing Hermes profiles are the execution pool, Kanban is an optional projection, and GitHub is the final handoff target. The first implementation increment is a local, synthetic-event steel thread: validate a fail-closed intake binding, build a source/context packet, derive a workflow/thread identity, and prove that no live Discord, gateway restart, credentials, remote git, or live Hermes home is touched.
+Build a Hermes-native software factory where Discord is the intake and collaboration surface and repository-local Spec Kit artifacts are the canonical persisted state. This tranche is deliberately bounded: validate a fail-closed intake binding, build a source/context packet, load the repository-local Spec Kit workflow contract without executing an official engine, create/reuse one Discord workflow thread, and persist clarify/approval gate replies. Profile dispatch, Kanban mutation, and GitHub PR creation remain packet-only/future work.
 
 ## Technical Context
 
 **Language/Version**: Python 3.11+ in the existing Hermes Agent repository
 
-**Primary Dependencies**: Existing Hermes gateway/platform abstractions, Discord adapter, channel prompts/skill bindings, `create_handoff_thread`, Hermes profile metadata, Kanban CLI/DB for optional projection, Spec Kit 0.12.10 initialized with `integration=hermes`
+**Primary Dependencies**: Existing Hermes gateway/platform abstractions, Discord adapter, channel prompts/skill bindings, `create_handoff_thread`, Hermes profile metadata, packet builders for optional Kanban/GitHub projections, repository-local `.specify/workflows/speckit/workflow.yml`
 
 **Storage**: Repository Spec Kit files under `specs/<feature>/`, plus future persisted workflow index/state in Hermes-managed storage scoped by `HERMES_HOME`; no live home writes in tests
 
@@ -26,7 +26,7 @@ Build a Hermes-native software factory where Discord is the intake and collabora
 
 **Constraints**: Preserve prompt caching; fail closed on missing config/permissions/routes; do not add a broad core model tool; do not make Kanban canonical; avoid live config, live gateway restarts, remote git, or credentials in development/tests
 
-**Scale/Scope**: V1 supports one or more configured intake channels, one workflow thread per accepted request, required role routes for the factory phases, optional Kanban mirror cards, and one GitHub PR handoff target per workflow
+**Scale/Scope**: V1 supports configured intake channels, one workflow thread per accepted request, required role route validation, optional Kanban/GitHub packet construction, and no live downstream dispatch/mutation.
 
 ## Constitution Check
 
@@ -37,7 +37,7 @@ The repository constitution template is unratified, so the operative gates are t
 - **Core narrow waist**: PASS — the design extends existing gateway/config/profile/spec surfaces and does not add a new always-present model tool.
 - **Prompt caching**: PASS — channel prompts/skills are injected only through existing per-session/new-session paths; workflow state changes do not rewrite active conversation history.
 - **Fail-closed permissions**: PASS — missing intake binding, missing route, unauthorized approval, and handoff credential absence block side effects.
-- **Existing infrastructure first**: PASS — uses Discord channel prompts/skill bindings, `create_handoff_thread`, existing profiles, existing Kanban projection, and Spec Kit workflow state.
+- **Existing infrastructure first**: PASS — uses Discord channel prompts/skill bindings, `create_handoff_thread`, existing profile route validation, packet-only Kanban/GitHub contracts, and repository-local Spec Kit state.
 - **E2E validation with temp homes**: PASS — quickstart and tasks require synthetic local tests before live gateway enablement.
 
 ## Project Structure
@@ -96,11 +96,11 @@ See [data-model.md](./data-model.md), [contracts/](./contracts/), and [quickstar
 1. Validate intake binding.
 2. Capture source/context packet.
 3. Derive workflow ID and thread title.
-4. Initialize Spec Kit feature/workflow state.
+4. Load the repository-local Spec Kit workflow contract and initialize helper workflow state without official execution.
 5. Post/use workflow thread.
 6. Advance only through persisted gates.
-7. Optionally mirror to Kanban.
-8. Prepare GitHub handoff packet after approval.
+7. Validate optional Kanban projection packets only; do not mutate Kanban from the gateway.
+8. Validate GitHub handoff packets only; do not create branches/PRs from the gateway.
 
 ## Post-Design Constitution Check
 
