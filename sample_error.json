@@ -1,0 +1,14 @@
+{
+  "error_id": "err_12345",
+  "timestamp": "2026-06-17T18:45:00Z",
+  "error_type": "TimeoutError",
+  "service": "auth-service",
+  "message": "Connection timeout to database during user authentication",
+  "stack_trace": "Traceback (most recent call last):\n  File \"/backend/services/auth.py\", line 45, in authenticate_user\n    db_result = database.query(query)\n  File \"/backend/database/__init__.py\", line 120, in query\n    response = requests.get(url, timeout=30)\n  File \"/usr/lib/python3.9/requests/api.py\", line 76, in get\n    return request('get', url, params=params, **kwargs)\nrequests.exceptions.Timeout: HTTPConnectionPool(host='db.internal', port=5432): Max retries exceeded with url: /users (Caused by TimeoutError())",
+  "metadata": {
+    "request_id": "req_abcde",
+    "user_id": "user_12345",
+    "endpoint": "/api/auth/login",
+    "duration_ms": 30000
+  }
+}

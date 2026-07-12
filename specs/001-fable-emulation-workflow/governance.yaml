@@ -1,0 +1,24 @@
+version: 1
+spec_governed: true
+spec_reference_required: true
+spec_mode: full_spec_kit
+canonical_spec: specs/001-clawta-hermes-agent-workflow/spec.md
+allowed_reference_forms:
+  - full_spec_kit_artifact_path
+  - lite_spec_kit_mission_contract_path
+  - legacy_migration_exception
+override_authority: Jared
+high_risk_requires_verifier: true
+extensions:
+  board_slug: clawta-hermes-agent-workflow
+  source_of_truth: governance.yaml sidecar inside the Spec Kit folder
+  kanban_db_metadata_role: cached/operational only
+  upstream_spec_kit_replacement: false
+  dispatch_gate_planned: true
+  completion_gate_planned: true
+  override_policy: one-time per card unless encoded in governance.yaml
+  compatibility:
+    canonical_path: specs/001-clawta-hermes-agent-workflow
+    legacy_path: specs/001-fable-emulation-workflow
+    compatibility_link: specs/001-clawta-hermes-agent-workflow -> specs/001-fable-emulation-workflow
+    rename_deferred_reason: Existing scripts, specs, and generated artifacts still reference the legacy directory; a compatibility symlink avoids breaking local history while presenting the canonical Clawta/Hermes path.

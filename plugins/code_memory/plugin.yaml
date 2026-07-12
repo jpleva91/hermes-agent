@@ -1,0 +1,9 @@
+name: code_memory
+version: 0.1.0
+description: Explicit local Code Memory v0 CLI/tool surfaces
+kind: backend
+provides_tools:
+  - code_memory_ingest
+  - code_memory_status
+  - code_memory_search
+  - code_memory_forget

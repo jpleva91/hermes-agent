@@ -1847,6 +1847,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None,
             notifier_profile=_active_profile_name(),
+            emit_event=True,
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:

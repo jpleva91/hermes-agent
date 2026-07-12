@@ -27,6 +27,137 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_notifier_delivers_workflow_thread_lifecycle_events(kanban_home):
+    """Subscribed workflow threads receive bind/start/progress/comment/block/done events."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="workflow contract", assignee="worker1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread42",
+            emit_event=True,
+        )
+        kb._append_event(conn, tid, "spawned", {"pid": 1234})
+        kb._append_event(conn, tid, "heartbeat", {"note": "material checkpoint"})
+        kb.add_comment(conn, tid, "missioncommander", "needs Jared: approve pilot completion")
+        kb.block_task(conn, tid, reason="review-required: opposite-model gate", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        kb.complete_task(
+            conn,
+            tid,
+            summary="approved and complete",
+            metadata={"artifacts": ["/tmp/evidence.txt"]},
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    delivered_msgs: list[str] = []
+    delivered_metadata: list[dict | None] = []
+
+    async def _capture_send(chat_id, msg, metadata=None):
+        delivered_msgs.append(msg)
+        delivered_metadata.append(metadata)
+        if len(delivered_msgs) >= 6:
+            runner._running = False
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock(side_effect=_capture_send)
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    joined = "\n".join(delivered_msgs)
+    assert "bound to workflow notifications" in joined
+    assert "worker started" in joined
+    assert "progress: material checkpoint" in joined
+    assert "comment by missioncommander" in joined
+    assert "needs Jared" in joined
+    assert "blocked: review-required: opposite-model gate" in joined
+    assert "done" in joined
+    assert "approved and complete" in joined
+    assert all(meta == {"thread_id": "thread42"} for meta in delivered_metadata)
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert subs == [], "completion is final and should unsubscribe after all workflow events deliver"
+
+
+@pytest.mark.asyncio
+async def test_notifier_delivers_discord_shaped_workflow_thread_subscription(kanban_home):
+    """Discord workflow subscriptions target the thread id as both chat_id and thread_id."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="discord workflow", assignee="worker1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="thread99",
+            thread_id="thread99",
+            notifier_profile="default",
+            emit_event=True,
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "default"
+
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    runner.adapters = {Platform.DISCORD: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_called_once()
+    assert fake_adapter.send.call_args.args[0] == "thread99"
+    assert fake_adapter.send.call_args.kwargs["metadata"] == {"thread_id": "thread99"}
+    assert "bound to workflow notifications" in fake_adapter.send.call_args.args[1]
+
+
+@pytest.mark.asyncio
 async def test_notifier_unsubs_after_completed_event(kanban_home):
     """
     Subscription should be remove after completed event
@@ -432,6 +563,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
         )
 
     fake_adapter.send.assert_called_once()
+    assert "done" in fake_adapter.send.call_args[0][1]
     conn = kb.connect()
     try:
         subs = kb.list_notify_subs(conn, tid)

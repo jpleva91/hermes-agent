@@ -1,0 +1,4 @@
+name: clawta
+kind: memory-provider
+description: Cross-model memory backed by the shared clawta-memory store (bi-temporal FTS5 + governance).
+entrypoint: clawta_memory_plugin.provider:register

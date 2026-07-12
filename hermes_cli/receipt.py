@@ -99,7 +99,8 @@ _TASK_FIELDS = (
 _RUN_FIELDS = (
     "id", "task_id", "profile", "step_key", "status", "outcome",
     "started_at", "ended_at",
-    "model", "tokens_in", "tokens_out", "cost_usd", "review_mode",
+    "model", "tokens_in", "tokens_out", "cached_tokens", "cost_usd",
+    "billing_mode", "wall_clock_seconds", "review_mode",
 )
 
 #: Verdict columns copied into the receipt when present.

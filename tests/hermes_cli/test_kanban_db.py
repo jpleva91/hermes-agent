@@ -3163,6 +3163,79 @@ def test_list_runs_filters_by_outcome_value(kanban_home):
     assert not empty
 
 
+def test_complete_task_stamps_metered_ledger_fields_from_metadata(kanban_home):
+    """Worker closeout must promote billing/cost metadata into queryable columns."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="metered", assignee="coder")
+        assert kb.claim_task(conn, tid)
+        assert kb.complete_task(
+            conn,
+            tid,
+            result="done",
+            metadata={
+                "model": "gpt-5.5",
+                "tokens_in": 1200,
+                "tokens_out": 300,
+                "cached_tokens": 256,
+                "cost_usd": 0.42,
+                "billing_mode": "api",
+                "wall_clock_seconds": 91.5,
+                "review_mode": "cross",
+            },
+        )
+        row = conn.execute(
+            "SELECT model, tokens_in, tokens_out, cached_tokens, cost_usd, "
+            "billing_mode, wall_clock_seconds, review_mode FROM task_runs "
+            "WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+    assert dict(row) == {
+        "model": "gpt-5.5",
+        "tokens_in": 1200,
+        "tokens_out": 300,
+        "cached_tokens": 256,
+        "cost_usd": 0.42,
+        "billing_mode": "api",
+        "wall_clock_seconds": 91.5,
+        "review_mode": "cross",
+    }
+
+
+def test_connect_migrates_metered_ledger_columns_on_legacy_task_runs(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db_path = home / "kanban.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+            assignee TEXT, priority INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER,
+            due_at INTEGER, result TEXT, claim_lock TEXT, claim_expires INTEGER,
+            worker_pid INTEGER, failure_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT, workspace_path TEXT, repo_path TEXT,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch', current_run_id INTEGER,
+            max_runtime_seconds INTEGER, last_heartbeat_at INTEGER,
+            run_generation INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL, profile TEXT, step_key TEXT,
+            status TEXT NOT NULL, started_at INTEGER NOT NULL,
+            ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT, error TEXT
+        );
+        """
+    )
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        cols = {r["name"] for r in migrated.execute("PRAGMA table_info(task_runs)")}
+
+    assert {"cached_tokens", "billing_mode", "wall_clock_seconds"}.issubset(cols)
+
+
 def test_tenant_propagates_to_events(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="tenant-task", tenant="biz-a")

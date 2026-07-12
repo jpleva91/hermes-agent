@@ -4071,6 +4071,18 @@ class TestCronDeliveryMirror:
             )
         assert tid == "9001"
 
+    def test_can_open_thread_for_discord_threaded_origin(self):
+        """Discord thread origins use chat_id == thread_id; attach_to_session
+        should open a sibling workflow thread instead of reusing the intake thread.
+        Non-Discord explicit topics/threads remain protected.
+        """
+        from cron.scheduler import _can_open_continuable_cron_thread
+
+        assert _can_open_continuable_cron_thread("discord", "1523", "1523") is True
+        assert _can_open_continuable_cron_thread("discord", "parent", "child") is False
+        assert _can_open_continuable_cron_thread("telegram", "123", "456") is False
+        assert _can_open_continuable_cron_thread("telegram", "123", None) is True
+
     def test_open_thread_returns_none_on_dm_platform(self):
         """A DM-only adapter (WhatsApp) inherits the base create_handoff_thread
         that returns None → _open_continuable_cron_thread returns None so the
@@ -4129,6 +4141,93 @@ class TestCronDeliveryMirror:
         assert seeded_source.thread_id == "9001"
         mirror_mock.assert_called_once()
         assert mirror_mock.call_args.kwargs.get("thread_id") == "9001"
+
+    def test_seed_thread_session_uses_thread_id_as_discord_chat_id(self):
+        """Discord inbound thread replies key sessions as chat_id=thread_id.
+        When a cron created from one Discord thread opens a new workflow thread,
+        seed the new workflow thread session, not the old origin thread session.
+        """
+        from cron.scheduler import _seed_cron_thread_session
+
+        store = MagicMock()
+        adapter = MagicMock()
+        adapter._session_store = store
+
+        with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            _seed_cron_thread_session(
+                {"id": "j1"}, adapter, "discord", "old-thread", "new-thread",
+                "Clarify brief", chat_name="Ops",
+            )
+
+        seeded_source = store.get_or_create_session.call_args[0][0]
+        assert seeded_source.chat_id == "new-thread"
+        assert seeded_source.thread_id == "new-thread"
+        mirror_mock.assert_called_once()
+        assert mirror_mock.call_args.args[1] == "new-thread"
+        assert mirror_mock.call_args.kwargs.get("thread_id") == "new-thread"
+
+    def test_extract_kanban_thread_binding_from_prompt_markers(self):
+        from cron.scheduler import _extract_kanban_thread_binding
+
+        task_id, board = _extract_kanban_thread_binding({
+            "prompt": "Kanban board: hermes-kanban-vnext\nKanban task: t_0cc9fb79\nAsk Jared.",
+        })
+
+        assert task_id == "t_0cc9fb79"
+        assert board == "hermes-kanban-vnext"
+
+    def test_seed_thread_session_subscribes_marked_kanban_task(self, tmp_path, monkeypatch):
+        from cron.scheduler import _seed_cron_thread_session
+        from hermes_cli import kanban_db as kb
+
+        db_path = tmp_path / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        kb.init_db()
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(conn, title="thread bind", assignee="worker")
+        finally:
+            conn.close()
+
+        store = MagicMock()
+        adapter = MagicMock()
+        adapter._session_store = store
+
+        with patch("gateway.mirror.mirror_to_session", return_value=True):
+            _seed_cron_thread_session(
+                {
+                    "id": "j1",
+                    "prompt": f"Kanban task: {tid}\nPost clarify brief.",
+                    "origin": {"user_id": "U42"},
+                },
+                adapter,
+                "discord",
+                "old-thread",
+                "new-thread",
+                "Clarify brief",
+            )
+
+        conn = kb.connect()
+        try:
+            subs = kb.list_notify_subs(conn, tid)
+            events = kb.list_events(conn, tid)
+        finally:
+            conn.close()
+        assert len(subs) == 1
+        assert subs[0]["platform"] == "discord"
+        assert subs[0]["chat_id"] == "new-thread"
+        assert subs[0]["thread_id"] == "new-thread"
+        assert subs[0]["user_id"] == "U42"
+        assert subs[0]["notifier_profile"]
+
+        bind_events = [ev for ev in events if ev.kind == "notify_subscribed"]
+        assert len(bind_events) == 1
+        assert bind_events[0].payload == {
+            "platform": "discord",
+            "chat_id": "new-thread",
+            "thread_id": "new-thread",
+            "notifier_profile": subs[0]["notifier_profile"],
+        }
 
     def test_seed_thread_session_noop_on_empty_text(self):
         from cron.scheduler import _seed_cron_thread_session

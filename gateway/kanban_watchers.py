@@ -163,8 +163,25 @@ class GatewayKanbanWatchersMixin:
             return
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        # writes — surface those transitions to subscribers too. The name is
+        # historical: this set now includes workflow-thread lifecycle events
+        # (bind, worker start, human-action comments, progress checkpoints)
+        # that are meaningful to a subscribed Discord/Telegram thread but are
+        # not task-terminal.
+        TERMINAL_KINDS = (
+            "notify_subscribed",
+            "spawned",
+            "heartbeat",
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "status",
+            "commented",
+            "archived",
+            "unblocked",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -343,7 +360,21 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "notify_subscribed":
+                            thread = ""
+                            if ev.payload and ev.payload.get("thread_id"):
+                                thread = f" thread={str(ev.payload['thread_id'])[:80]}"
+                            msg = f"🔔 {board_tag}{tag}Kanban {sub['task_id']} bound to workflow notifications{thread} — {title}"
+                        elif kind == "spawned":
+                            msg = f"▶ {board_tag}{tag}Kanban {sub['task_id']} worker started — {title}"
+                        elif kind == "heartbeat":
+                            note = ""
+                            if ev.payload and ev.payload.get("note"):
+                                note = f": {str(ev.payload['note']).strip()[:220]}"
+                            else:
+                                note = ": checkpoint"
+                            msg = f"· {board_tag}{tag}Kanban {sub['task_id']} progress{note}"
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -396,6 +427,27 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind == "commented":
+                            author = ""
+                            preview = ""
+                            if ev.payload:
+                                if ev.payload.get("author"):
+                                    author = str(ev.payload["author"])[:80]
+                                if ev.payload.get("preview"):
+                                    preview = str(ev.payload["preview"]).strip()
+                            if not preview:
+                                # Legacy commented events only carried author/len.
+                                # Claim/advance them so future terminal events are
+                                # not wedged behind old comments, but avoid sending
+                                # a useless empty notification.
+                                continue
+                            if len(preview) > 500:
+                                preview = preview[:497].rstrip() + "…"
+                            by = f" by {author}" if author else ""
+                            msg = (
+                                f"💬 {board_tag}{tag}Kanban {sub['task_id']} comment{by}"
+                                f" — {title}\n{preview}"
+                            )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't

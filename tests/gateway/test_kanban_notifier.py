@@ -83,9 +83,47 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    assert "Kanban" in adapter.sent[0]["text"]
-    assert tid in adapter.sent[0]["text"]
+    texts = [d["text"] for d in adapter.sent]
+    done_texts = [t for t in texts if " done " in t]
+    assert len(done_texts) == 1
+    assert "Kanban" in done_texts[0]
+    assert tid in done_texts[0]
+
+
+def test_kanban_notifier_delivers_subscribed_comments(tmp_path, monkeypatch):
+    """Subscribed workflow threads receive task comments, not only terminal events.
+
+    This is the Spec Kit thread contract: material progress / needs-human
+    comments on a card must surface in the dedicated Discord thread instead of
+    staying hidden in the Kanban DB.
+    """
+    db_path = tmp_path / "comment-notify.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="threaded workflow", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_comment(
+            conn,
+            tid,
+            author="missioncommander",
+            body="Needs Jared: choose the target branch before implementation.",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    texts = [d["text"] for d in adapter.sent]
+    comment_texts = [t for t in texts if " comment by missioncommander" in t]
+    assert len(comment_texts) == 1
+    text = comment_texts[0]
+    assert "comment by missioncommander" in text
+    assert "Needs Jared: choose the target branch" in text
+    assert tid in text
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
@@ -101,7 +139,7 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter1)))
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter2)))
 
-    assert len(adapter1.sent) == 1
+    assert len([d for d in adapter1.sent if " done " in d["text"]]) == 1
     assert adapter2.sent == []
 
 
@@ -202,9 +240,8 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # First crash delivered.
-    assert len(adapter.sent) == 1
-    assert "crashed" in adapter.sent[0]["text"].lower()
+    # First crash delivered, plus the subscription-bind lifecycle message.
+    assert len([d for d in adapter.sent if "crashed" in d["text"].lower()]) == 1
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -228,11 +265,11 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 2, (
-        f"Second crashed event should also notify; got {len(adapter.sent)} "
-        f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
+    crash_texts = [d["text"] for d in adapter.sent if "crashed" in d["text"].lower()]
+    assert len(crash_texts) == 2, (
+        f"Second crashed event should also notify; got {len(crash_texts)} "
+        f"crash deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
-    assert "crashed" in adapter.sent[1]["text"].lower()
 
 
 def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypatch):

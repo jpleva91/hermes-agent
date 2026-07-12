@@ -1,0 +1,42 @@
+- generic [active] [ref=e1]:
+  - img
+  - generic: 🦋
+  - generic: 🦋
+  - generic:
+    - heading "🎀 Catalina's Duck & Bunny Parade 🎀" [level=1]
+    - paragraph: Tap anywhere for sparkles • tap the duck & bunny to say hi!
+  - generic:
+    - generic:
+      - button "Pink duck, tap to say hi" [ref=e14] [cursor=pointer]:
+        - img [ref=e15]
+      - button "Yellow bunny, tap to say hi" [ref=e38] [cursor=pointer]:
+        - img [ref=e39]
+  - generic [ref=e68]: 🌸
+  - generic [ref=e69]: 🌼
+  - generic [ref=e70]: 🌷
+  - generic [ref=e71]: 🌻
+  - generic [ref=e72]: 💐
+  - generic:
+    - generic: 🌱
+    - generic: 🌿
+    - generic: 🌱
+    - generic: 🌿
+    - generic: 🌱
+    - generic: 🌿
+    - generic: 🌱
+  - generic: ✨ tap anywhere ✨
+  - generic:
+    - generic: 💕
+  - navigation "Play controls" [ref=e74]:
+    - button "Rainbow" [ref=e75] [cursor=pointer]:
+      - generic [ref=e76]: 🌈
+      - text: Rainbow
+    - button "Bedtime stars" [ref=e77] [cursor=pointer]:
+      - generic [ref=e78]: 🌙
+      - text: Bedtime stars
+    - button "Parade" [ref=e79] [cursor=pointer]:
+      - generic [ref=e80]: 🎺
+      - text: Parade
+    - button "Surprise hug" [ref=e81] [cursor=pointer]:
+      - generic [ref=e82]: 🤗
+      - text: Surprise hug

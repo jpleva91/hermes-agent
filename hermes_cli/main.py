@@ -11929,7 +11929,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "mission-health", "receipt",
+        "mission-health", "receipt", "stamp",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
@@ -12728,6 +12728,35 @@ def main():
     receipt_parser.add_argument("--verify", default=None, metavar="RECEIPT_JSON",
                                 help="Verify an existing receipt file (exit 0/1)")
     receipt_parser.set_defaults(func=_cmd_receipt)
+
+    # =========================================================================
+    # stamp — metered-ledger coverage for worker closeout rows
+    # =========================================================================
+    def _cmd_stamp(args):
+        from hermes_cli.stamp import main as _stamp_main
+
+        argv = [args.stamp_command] if getattr(args, "stamp_command", None) else []
+        if getattr(args, "board", None):
+            argv += ["--board", args.board]
+        if getattr(args, "json", False):
+            argv.append("--json")
+        if getattr(args, "sample", None) is not None:
+            argv += ["--sample", str(args.sample)]
+        return _stamp_main(argv)
+
+    stamp_parser = subparsers.add_parser(
+        "stamp",
+        help="Verify metered-ledger cost/lane stamps on Mission Engine task runs",
+    )
+    stamp_sub = stamp_parser.add_subparsers(dest="stamp_command")
+    stamp_verify = stamp_sub.add_parser(
+        "verify",
+        help="Verify task_run model/token/cost/billing-mode coverage",
+    )
+    stamp_verify.add_argument("--board", default=None, help="Board slug")
+    stamp_verify.add_argument("--json", action="store_true", help="Emit JSON")
+    stamp_verify.add_argument("--sample", type=int, default=10, help="Max missing-row samples per board")
+    stamp_verify.set_defaults(func=_cmd_stamp)
 
     # =========================================================================
     # project command — named, multi-folder workspaces

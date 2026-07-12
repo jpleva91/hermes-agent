@@ -5220,7 +5220,35 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
-        # DMs, voice channels, and existing threads can't host child threads.
+        # If the origin is already a thread, create a sibling handoff thread
+        # under its parent text/forum channel. Cron jobs created from a Discord
+        # thread capture that thread as the origin chat_id; without this parent
+        # hop, attach_to_session falls back to posting into the same thread
+        # instead of opening a dedicated workflow thread.
+        if isinstance(parent, getattr(discord, "Thread", ())):
+            thread_parent = getattr(parent, "parent", None)
+            if thread_parent is None:
+                parent_id = getattr(parent, "parent_id", None)
+                if parent_id is not None:
+                    try:
+                        thread_parent = self._client.get_channel(int(parent_id))
+                        if thread_parent is None:
+                            thread_parent = await self._client.fetch_channel(int(parent_id))
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Handoff thread: cannot resolve parent channel for thread %s: %s",
+                            self.name, parent_chat_id, exc,
+                        )
+                        return None
+            if thread_parent is None:
+                logger.info(
+                    "[%s] Handoff thread: origin %s is a thread without a resolvable parent",
+                    self.name, parent_chat_id,
+                )
+                return None
+            parent = thread_parent
+
+        # DMs and voice channels can't host child threads.
         if isinstance(parent, getattr(discord, "DMChannel", ())):
             logger.info(
                 "[%s] Handoff thread: parent %s is a DM; threads not supported here",
@@ -5235,11 +5263,21 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             create = getattr(parent, "create_thread", None)
             if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                )
+                kwargs = {
+                    "name": thread_name,
+                    "auto_archive_duration": 1440,
+                    "reason": reason,
+                }
+                public_thread = getattr(getattr(discord, "ChannelType", None), "public_thread", None)
+                if public_thread is not None:
+                    # TextChannel.create_thread defaults can produce a private
+                    # bot-only thread on some discord.py/API combinations when
+                    # no starter message is supplied. Spec/clarify handoff
+                    # threads must be visible in the parent channel's thread
+                    # list, so explicitly request a public thread when the
+                    # installed discord.py version exposes the enum.
+                    kwargs["type"] = public_thread
+                thread = await create(**kwargs)
                 return str(thread.id)
         except Exception as direct_error:
             logger.debug(

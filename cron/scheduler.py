@@ -624,6 +624,105 @@ def _open_continuable_cron_thread(
         return None
 
 
+def _can_open_continuable_cron_thread(
+    platform_name: str,
+    chat_id: str,
+    thread_id: Optional[str],
+) -> bool:
+    """Return whether attach_to_session may open a new dedicated thread.
+
+    Existing explicit topics/threads normally mean "deliver there" and must not
+    be overridden. Discord threaded origins are special: the inbound adapter keys
+    messages from a thread as chat_id=<thread_id>, thread_id=<thread_id>. In that
+    shape, a continuable cron should open a sibling workflow thread rather than
+    reuse the intake thread.
+    """
+    if not thread_id:
+        return True
+    return (
+        str(platform_name).lower() == "discord"
+        and str(thread_id) == str(chat_id)
+    )
+
+
+def _extract_kanban_thread_binding(job: dict) -> tuple[Optional[str], Optional[str]]:
+    """Extract optional Kanban task/board markers from a cron job.
+
+    Spec Kit clarify/review jobs are often created from cron as short-lived
+    thread handoffs. The cron schema does not yet have first-class
+    ``kanban_task_id`` fields, so accept both explicit dict keys (future-proof)
+    and human-readable prompt/name markers such as:
+
+        Kanban task: t_1234abcd
+        Kanban board: hermes-kanban-vnext
+
+    Returns ``(task_id, board_slug)``.  Best-effort; absence means no binding.
+    """
+    task_id = job.get("kanban_task_id") or job.get("task_id")
+    board = job.get("kanban_board") or job.get("board")
+    haystack = "\n".join(
+        str(job.get(k) or "")
+        for k in ("name", "prompt", "description", "summary")
+    )
+    if not task_id:
+        m = re.search(r"\b(?:Kanban\s+task|task_id|task)\s*[:=]\s*(t_[0-9a-f]{8,})\b", haystack, re.I)
+        if m:
+            task_id = m.group(1)
+    if not board:
+        m = re.search(r"\b(?:Kanban\s+board|board)\s*[:=]\s*([a-z0-9][a-z0-9_-]{0,63})\b", haystack, re.I)
+        if m:
+            board = m.group(1)
+    return (str(task_id) if task_id else None, str(board) if board else None)
+
+
+def _maybe_subscribe_kanban_thread(
+    job: dict,
+    platform_name: str,
+    chat_id: str,
+    thread_id: str,
+    *,
+    user_id: Optional[str] = None,
+) -> bool:
+    """Best-effort bind of an opened workflow thread to a Kanban card.
+
+    The Discord thread is the human cockpit; the Kanban DB is durable state.
+    When a cron handoff job names a Kanban task, subscribe that task to the new
+    thread before work continues so subsequent comments/blocked/completed events
+    become visible in-thread.
+    """
+    task_id, board = _extract_kanban_thread_binding(job)
+    if not task_id:
+        return False
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=str(platform_name).lower(),
+                chat_id=str(thread_id) if str(platform_name).lower() == "discord" else str(chat_id),
+                thread_id=str(thread_id),
+                user_id=user_id,
+                notifier_profile=os.environ.get("HERMES_PROFILE") or "default",
+                emit_event=True,
+            )
+        finally:
+            conn.close()
+        logger.info(
+            "Job '%s': subscribed Kanban %s/%s to workflow thread %s on %s",
+            job.get("id", "?"), board or "default", task_id, thread_id, platform_name,
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "Job '%s': failed to subscribe Kanban workflow thread for task %s board %s: %s",
+            job.get("id", "?"), task_id, board or "default", e,
+        )
+        return False
+
+
 def _seed_cron_thread_session(
     job: dict,
     adapter,
@@ -650,6 +749,13 @@ def _seed_cron_thread_session(
     text = (mirror_text or "").strip()
     if not text:
         return
+    # Discord thread replies are session-keyed as chat_id=<thread_id>,
+    # thread_id=<thread_id> (see DiscordAdapter._handle_message).  Telegram and
+    # Slack topics keep the parent chat/conversation as chat_id.  When a cron job
+    # is scheduled from inside an existing Discord thread, the origin chat_id is
+    # that old thread; if attach_to_session opens a new workflow thread, seed the
+    # new thread's session key instead of the origin thread's session key.
+    session_chat_id = str(thread_id) if str(platform_name).lower() == "discord" else str(chat_id)
     try:
         from gateway.config import Platform
         from gateway.session import SessionSource
@@ -663,7 +769,7 @@ def _seed_cron_thread_session(
             if platform_enum is not None:
                 dest_source = SessionSource(
                     platform=platform_enum,
-                    chat_id=str(chat_id),
+                    chat_id=session_chat_id,
                     chat_name=chat_name,
                     chat_type="thread",
                     user_id="system:cron",
@@ -683,12 +789,19 @@ def _seed_cron_thread_session(
         # thread-keyed session row we just created.
         mirror_to_session(
             platform_name,
-            str(chat_id),
+            session_chat_id,
             f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}",
             source_label="cron",
             thread_id=str(thread_id),
             user_id="system:cron",
             role="user",
+        )
+        _maybe_subscribe_kanban_thread(
+            job,
+            platform_name,
+            chat_id,
+            thread_id,
+            user_id=getattr(job, "user_id", None) if not isinstance(job, dict) else (job.get("user_id") or (job.get("origin") or {}).get("user_id")),
         )
         logger.info(
             "Job '%s': opened continuable thread %s on %s:%s and seeded the brief",
@@ -1425,7 +1538,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and not in_channel_surface
             and runtime_adapter is not None
             and loop is not None
-            and not thread_id  # never override an explicit origin thread/topic
+            and _can_open_continuable_cron_thread(platform_name, chat_id, thread_id)
         ):
             new_thread_id = _open_continuable_cron_thread(
                 job, runtime_adapter, chat_id, loop,

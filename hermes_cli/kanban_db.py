@@ -1391,7 +1391,15 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    model               TEXT,
+    tokens_in           INTEGER,
+    tokens_out          INTEGER,
+    cached_tokens       INTEGER,
+    cost_usd            REAL,
+    billing_mode        TEXT,
+    wall_clock_seconds  REAL,
+    review_mode         TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2363,7 +2371,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("model", "model TEXT"),
             ("tokens_in", "tokens_in INTEGER"),
             ("tokens_out", "tokens_out INTEGER"),
+            ("cached_tokens", "cached_tokens INTEGER"),
             ("cost_usd", "cost_usd REAL"),
+            ("billing_mode", "billing_mode TEXT"),
+            ("wall_clock_seconds", "wall_clock_seconds REAL"),
             ("review_mode", "review_mode TEXT"),
         ):
             if name not in run_cols:
@@ -2411,7 +2422,9 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, model TEXT, tokens_in INTEGER, tokens_out INTEGER,"
+        " cached_tokens INTEGER, cost_usd REAL, billing_mode TEXT,"
+        " wall_clock_seconds REAL, review_mode TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -3231,8 +3244,23 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        clean_body = body.strip()
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {
+                "author": author.strip(),
+                "len": len(body),
+                "comment_id": comment_id,
+                # Keep event payload lightweight while giving notification
+                # watchers enough context to mirror meaningful progress to
+                # subscribed workflow threads without another fragile join.
+                "preview": clean_body[:600],
+            },
+        )
+        return comment_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -4435,7 +4463,16 @@ def complete_task(
         # cross_model are queryable, not archaeology.
         if run_id is not None and isinstance(metadata, dict):
             _cost_updates = {}
-            for _k in ("model", "tokens_in", "tokens_out", "cost_usd", "review_mode"):
+            for _k in (
+                "model",
+                "tokens_in",
+                "tokens_out",
+                "cached_tokens",
+                "cost_usd",
+                "billing_mode",
+                "wall_clock_seconds",
+                "review_mode",
+            ):
                 if metadata.get(_k) is not None:
                     _cost_updates[_k] = metadata[_k]
             if _cost_updates:
@@ -9239,12 +9276,13 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    emit_event: bool = False,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
     now = int(time.time())
     with write_txn(conn):
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
@@ -9252,6 +9290,7 @@ def add_notify_sub(
             """,
             (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
         )
+        inserted = cur.rowcount == 1
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
             # backfilling only when the existing value is unset.
@@ -9263,6 +9302,18 @@ def add_notify_sub(
                    AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+            )
+        if inserted and emit_event:
+            _append_event(
+                conn,
+                task_id,
+                "notify_subscribed",
+                {
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id or "",
+                    "notifier_profile": notifier_profile,
+                },
             )
 
 
